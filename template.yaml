@@ -174,10 +174,14 @@ Resources:
       Timeout: 120
       # Every deploy publishes an immutable version and moves the "live" alias
       # to it. S3 invokes the alias, so rolling back is just pointing the alias
-      # at an older version. AllProperties makes config changes (like a new
-      # ReleaseId) publish a version too, not only image changes.
+      # at an older version.
       AutoPublishAlias: live
       AutoPublishAliasAllProperties: true
+      # SAM decides whether to publish by hashing the template before
+      # parameters are resolved, so a new ReleaseId in the environment alone
+      # left the version unchanged (seen on the second deploy). Using it as
+      # the code hash makes each release publish a new version.
+      AutoPublishCodeSha256: !Ref ReleaseId
       VpcConfig:
         SubnetIds:
           - !Ref PrivateSubnetA
