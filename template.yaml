@@ -9,6 +9,15 @@ Parameters:
     Description: >-
       Only objects whose key ends with this suffix trigger the function.
       Can't be .zip, otherwise the function would re-trigger on its own output.
+  VpcCidr:
+    Type: String
+    Default: 10.20.0.0/16
+  PrivateSubnetACidr:
+    Type: String
+    Default: 10.20.0.0/20
+  PrivateSubnetBCidr:
+    Type: String
+    Default: 10.20.16.0/20
 
 Rules:
   SuffixMustNotBeZip:
@@ -17,6 +26,101 @@ Rules:
         AssertDescription: SourceSuffix can't be .zip
 
 Resources:
+  # --- network -------------------------------------------------------------
+  # Private subnets only: no internet gateway, no NAT. The function's only
+  # dependency is S3, which it reaches through a gateway endpoint. A NAT
+  # gateway would bill per GB for every byte the function reads and writes.
+
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-vpc"
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnetACidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private-a"
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnetBCidr
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private-b"
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private"
+
+  PrivateSubnetARouteTable:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetBRouteTable:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Gateway
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+      # Nothing in this VPC should talk to any bucket other than ours.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+              - s3:ListBucket
+            Resource:
+              - !Sub "arn:${AWS::Partition}:s3:::${AWS::StackName}-${AWS::AccountId}-${AWS::Region}"
+              - !Sub "arn:${AWS::Partition}:s3:::${AWS::StackName}-${AWS::AccountId}-${AWS::Region}/*"
+
+  FunctionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Archiver function, outbound HTTPS only
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        # The route table only has the S3 endpoint, so 0.0.0.0/0 here doesn't
+        # open a path to the internet.
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  # --- storage -------------------------------------------------------------
+
   ArchiveBucket:
     Type: AWS::S3::Bucket
     Properties:
@@ -39,14 +143,24 @@ Resources:
       # Versioning is intentionally off. With versioning on, deleting the
       # original only adds a delete marker and the bytes stay billed.
 
+  # --- compute -------------------------------------------------------------
+
   ArchiverFunction:
     Type: AWS::Serverless::Function
+    # don't let S3 events reach the function before it has a route to S3
+    DependsOn: S3GatewayEndpoint
     Properties:
       PackageType: Image
       Architectures:
         - x86_64
       MemorySize: 1024
       Timeout: 120
+      VpcConfig:
+        SubnetIds:
+          - !Ref PrivateSubnetA
+          - !Ref PrivateSubnetB
+        SecurityGroupIds:
+          - !Ref FunctionSecurityGroup
       Environment:
         Variables:
           LOG_LEVEL: INFO
@@ -84,3 +198,7 @@ Outputs:
     Value: !Ref ArchiveBucket
   FunctionName:
     Value: !Ref ArchiverFunction
+  VpcId:
+    Value: !Ref Vpc
+  PrivateSubnetIds:
+    Value: !Join [",", [!Ref PrivateSubnetA, !Ref PrivateSubnetB]]
