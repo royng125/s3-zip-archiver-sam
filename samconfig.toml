@@ -1,0 +1,16 @@
+version = 0.1
+
+[default.global.parameters]
+stack_name = "s3-zip-archiver"
+region = "ap-southeast-1"
+
+[default.build.parameters]
+cached = true
+
+[default.deploy.parameters]
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = false
+fail_on_empty_changeset = false
+# let SAM create the artifact bucket and ECR repo so no account ids end up in this file
+resolve_s3 = true
+resolve_image_repos = true
