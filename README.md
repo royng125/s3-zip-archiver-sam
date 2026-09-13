@@ -199,3 +199,93 @@ interfaces asynchronously.
   loop, so the trigger is limited to the configured suffix.
 - One ZIP per source object, stored next to it as `<key>.zip`.
 - Region is `ap-southeast-1`; prices in the cost section are for that region.
+
+## Cost analysis
+
+### Assumptions
+
+- 1,000,000 files per hour x 730 hours = **730 million files a month**,
+  10 MB each, one invocation per file.
+- Duration and log volume are the measured values from the deployment above:
+  715 ms average at 1024 MB, ~507 bytes of logs per invocation.
+- Compression ratio 6.44x, measured on synthetic JSON. Real video-analysis
+  output could compress better or worse, and the storage numbers scale directly
+  with this ratio.
+- On-demand prices for `ap-southeast-1` from the AWS Price List API, free tier
+  ignored. The producer's own uploads (and their PUT requests) already exist
+  today, so they're not counted as part of this feature.
+
+`scripts/cost_estimate.py` reproduces every number below:
+
+```bash
+python scripts/cost_estimate.py --duration-ms 715 --ratio 6.44 --log-bytes 507
+```
+
+### What the feature costs to run
+
+| item | volume per month | USD / month |
+|---|---|---|
+| Lambda requests | 730M x $0.20 per 1M | 146 |
+| Lambda compute, x86_64 | 521.95M GB-s x $0.0000166667 | 8,699 |
+| S3 GET, read original | 730M x $0.0004 per 1K | 292 |
+| S3 PUT, write zip | 730M x $0.005 per 1K | 3,650 |
+| S3 HEAD x2, verify zip + check original | 1,460M x $0.0004 per 1K | 584 |
+| S3 DELETE | free | 0 |
+| CloudWatch Logs ingestion | ~345 GB x $0.70 | 241 |
+| S3 gateway endpoint, in-region transfer | free | 0 |
+| ECR image (207 MB) and SQS (failures only) | | < 1 |
+| **total** | | **~13,600** |
+
+Cold starts add a little on top: the image's 1.9 s init is billed, but at
+~200 warm environments running continuously they are a very small share of
+invocations.
+
+### What it saves
+
+One month of output is 6.80 PiB of raw JSON or 1.06 PiB zipped. Kept in
+S3 Standard, that month of data costs:
+
+| | size | USD per month it is stored |
+|---|---|---|
+| raw JSON (today) | 6.80 PiB | 164,528 |
+| zipped | 1.06 PiB | 26,024 |
+| **difference** | | **138,504** |
+
+### Monthly figure
+
+- **The feature itself costs about US$13,600 per month.**
+- In the first month it removes about US$138,500 of storage, so the bill is
+  roughly **US$124,900 lower** than without it.
+- The gap widens every month because stored data accumulates while the
+  processing cost stays flat. After a year of retention, storage would be
+  around US$312K/month zipped against about US$1.97M/month raw.
+
+### Ways to save more
+
+Roughly in order of impact:
+
+1. **Keep S3 traffic off NAT.** Already done here. The same design through a
+   NAT gateway would add about **US$486,000 per month** in data processing,
+   more than everything else combined.
+2. **Compress before uploading.** If the on-prem exporter writes ZIP (or
+   gzip/zstd) itself, the whole ~US$13.6K of processing disappears and upload
+   bandwidth drops about 6x. This Lambda is the right tool when the producer
+   can't be changed.
+3. **Move old archives to a colder class.** Zipped data in Glacier Instant
+   Retrieval costs ~US$5,500 per month of data instead of ~US$26,000 in
+   Standard. Deep Archive is ~US$2,200, but lifecycle transitions are charged
+   per object (US$43,800 for 730M objects), there's a 180-day minimum and
+   retrieval takes hours, so it only pays off for data that is almost never
+   read.
+4. **Fewer, bigger objects.** PUT, HEAD and especially lifecycle transition
+   costs are per object. Bundling files into one archive per minute or per
+   video (S3 -> SQS -> batch consumer) divides those line items by the
+   bundle size.
+5. **arm64.** Graviton compute is 20% cheaper here, about US$1,740/month
+   saved. Needs the image built for arm64.
+6. **Right-size memory.** Max memory used was 111 MB out of 1024 MB. Lowering
+   memory also lowers CPU, so duration will go up; the cheapest setting has to
+   be measured (e.g. with AWS Lambda Power Tuning). Not measured here.
+7. **Smaller wins.** Log successful archives at DEBUG in production, buy a
+   Compute Savings Plan for the Lambda spend, and drop the verification HEAD
+   calls (US$584) if the PUT response is considered enough.
