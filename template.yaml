@@ -9,6 +9,15 @@ Parameters:
     Description: >-
       Only objects whose key ends with this suffix trigger the function.
       Can't be .zip, otherwise the function would re-trigger on its own output.
+  ReleaseId:
+    Type: String
+    Default: manual
+    Description: >-
+      Identifier of the release being deployed (the Makefile passes the git
+      commit). Changing it is what forces a new Lambda version on every deploy.
+  LogRetentionDays:
+    Type: Number
+    Default: 14
   VpcCidr:
     Type: String
     Default: 10.20.0.0/16
@@ -143,6 +152,14 @@ Resources:
       # Versioning is intentionally off. With versioning on, deleting the
       # original only adds a delete marker and the bytes stay billed.
 
+  # Events that still fail after Lambda's async retries end up here instead
+  # of being dropped.
+  FailedEventsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
   # --- compute -------------------------------------------------------------
 
   ArchiverFunction:
@@ -155,6 +172,12 @@ Resources:
         - x86_64
       MemorySize: 1024
       Timeout: 120
+      # Every deploy publishes an immutable version and moves the "live" alias
+      # to it. S3 invokes the alias, so rolling back is just pointing the alias
+      # at an older version. AllProperties makes config changes (like a new
+      # ReleaseId) publish a version too, not only image changes.
+      AutoPublishAlias: live
+      AutoPublishAliasAllProperties: true
       VpcConfig:
         SubnetIds:
           - !Ref PrivateSubnetA
@@ -164,6 +187,14 @@ Resources:
       Environment:
         Variables:
           LOG_LEVEL: INFO
+          RELEASE_ID: !Ref ReleaseId
+      EventInvokeConfig:
+        MaximumRetryAttempts: 2
+        MaximumEventAgeInSeconds: 21600
+        DestinationConfig:
+          OnFailure:
+            Type: SQS
+            Destination: !GetAtt FailedEventsQueue.Arn
       Policies:
         - Statement:
             - Effect: Allow
@@ -193,11 +224,23 @@ Resources:
       Dockerfile: Dockerfile
       DockerTag: python3.12
 
+  # Lambda would create this group itself on first run, but with no retention,
+  # and at millions of invocations a day log storage adds up.
+  ArchiverLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ArchiverFunction}"
+      RetentionInDays: !Ref LogRetentionDays
+
 Outputs:
   BucketName:
     Value: !Ref ArchiveBucket
   FunctionName:
     Value: !Ref ArchiverFunction
+  LiveAlias:
+    Value: !Ref ArchiverFunctionAliaslive
+  FailedEventsQueueUrl:
+    Value: !Ref FailedEventsQueue
   VpcId:
     Value: !Ref Vpc
   PrivateSubnetIds:
