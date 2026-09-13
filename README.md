@@ -69,11 +69,14 @@ is deliberately off; with it on, "deleting" the original would only add a
 delete marker and save nothing.
 
 **Versions and rollback.** `AutoPublishAlias: live` publishes an immutable
-version on each deploy and S3 always invokes the alias. The Makefile passes
-the git commit as `ReleaseId`, which is set as an environment variable, so a
-deploy of a new commit always produces a new version (together with
-`AutoPublishAliasAllProperties`), even when the image is byte-for-byte the
-same. Rolling back means moving the alias to a previous version.
+version and S3 always invokes the alias, never `$LATEST`. The Makefile passes
+the git commit as `ReleaseId`. On its own, putting that value in an
+environment variable was not enough: SAM decides whether to publish from a
+hash of the template taken before parameters are resolved, so the second
+deploy updated `$LATEST` without creating a version. `ReleaseId` is now also
+passed as `AutoPublishCodeSha256`, which makes every release publish a new
+version even when the image is byte-for-byte the same. Old versions are
+retained, so rolling back means moving the alias to one of them.
 
 **Circular dependency.** A bucket notification that targets a function whose
 IAM policy `!Ref`s the same bucket is a cycle CloudFormation refuses to
@@ -161,6 +164,22 @@ make rollback VERSION=3
 
 Note that the next `make deploy` moves the alias forward again; to stay on an
 old release, redeploy that commit.
+
+Checked on the deployed stack after three deploys:
+
+```
+Version  RELEASE_ID
+1        14d9ff4
+2        3470e19
+3        23048e7     <- live
+
+make rollback VERSION=2   -> live = 2
+upload results/rollback-check.json
+log stream 2026/09/13/[2]280a3cf1…  archived …/rollback-check.json
+make rollback VERSION=3   -> live = 3
+```
+
+The `[2]` in the log stream name is the version that handled the event.
 
 ### Removing the stack
 
