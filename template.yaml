@@ -1,0 +1,86 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Compress new objects in an S3 bucket to ZIP with a container-image Lambda
+
+Parameters:
+  SourceSuffix:
+    Type: String
+    Default: .json
+    Description: >-
+      Only objects whose key ends with this suffix trigger the function.
+      Can't be .zip, otherwise the function would re-trigger on its own output.
+
+Rules:
+  SuffixMustNotBeZip:
+    Assertions:
+      - Assert: !Not [!Equals [!Ref SourceSuffix, ".zip"]]
+        AssertDescription: SourceSuffix can't be .zip
+
+Resources:
+  ArchiveBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      # Fixed name so the function policy can point at it without !Ref.
+      # Referencing the bucket from both the policy and the notification
+      # gives CloudFormation a circular dependency.
+      BucketName: !Sub "${AWS::StackName}-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      # Versioning is intentionally off. With versioning on, deleting the
+      # original only adds a delete marker and the bytes stay billed.
+
+  ArchiverFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      PackageType: Image
+      Architectures:
+        - x86_64
+      MemorySize: 1024
+      Timeout: 120
+      Environment:
+        Variables:
+          LOG_LEVEL: INFO
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+                - s3:DeleteObject
+              Resource: !Sub "arn:${AWS::Partition}:s3:::${AWS::StackName}-${AWS::AccountId}-${AWS::Region}/*"
+            # without ListBucket a missing key comes back as 403 instead of 404,
+            # and the handler can't tell "already archived" from a real error
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub "arn:${AWS::Partition}:s3:::${AWS::StackName}-${AWS::AccountId}-${AWS::Region}"
+      Events:
+        NewObject:
+          Type: S3
+          Properties:
+            Bucket: !Ref ArchiveBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: !Ref SourceSuffix
+    Metadata:
+      DockerContext: ./archiver
+      Dockerfile: Dockerfile
+      DockerTag: python3.12
+
+Outputs:
+  BucketName:
+    Value: !Ref ArchiveBucket
+  FunctionName:
+    Value: !Ref ArchiverFunction
