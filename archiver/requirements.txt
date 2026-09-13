@@ -1,0 +1,2 @@
+# pinned so the image doesn't silently change with whatever the base image ships
+boto3==1.43.93
