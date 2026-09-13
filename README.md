@@ -289,3 +289,54 @@ Roughly in order of impact:
 7. **Smaller wins.** Log successful archives at DEBUG in production, buy a
    Compute Savings Plan for the Lambda spend, and drop the verification HEAD
    calls (US$584) if the PUT response is considered enough.
+
+## Scalability and bottlenecks
+
+**Short answer:** it handles this volume without a redesign, but one Lambda
+invocation per object is not the most cost-efficient shape at this scale, and
+a few limits need attention before production.
+
+At 1,000,000 files per hour the steady load is ~278 events per second. At
+715 ms each that's **about 200 concurrent executions** on average, plus
+whatever the producer's burstiness adds.
+
+1. **Lambda concurrency quota.** The default regional limit is 1,000
+   concurrent executions shared by every function in the account. A 5x burst
+   reaches it. Throttled async events are retried for up to 6 hours
+   (`MaximumEventAgeInSeconds`) and then land in the failed-events queue.
+   Before production: request a quota increase, set reserved concurrency so
+   this function can't starve others, and alarm on `Throttles`.
+2. **The backlog is hard to see.** S3 -> Lambda is an async invoke with an
+   internal queue; the only signal is `AsyncEventAge`. Putting SQS between S3
+   and Lambda gives a visible queue depth, batching and a max concurrency
+   setting on the event source mapping. I'd do that for production.
+3. **S3 request rates per prefix.** S3 supports 3,500 PUT/COPY/POST/DELETE and
+   5,500 GET/HEAD requests per second per partitioned prefix. Steady state
+   here is ~834 write requests/s (producer PUT + zip PUT + DELETE) and ~834
+   GET/HEAD/s. That's fine on average, but a burst into a single prefix can
+   return `503 SlowDown` while S3 re-partitions. Spreading keys across
+   prefixes (date/hour or a hash) avoids it.
+4. **VPC limits.** Lambda uses shared Hyperplane ENIs per subnet and security
+   group combination, so concurrency doesn't use one IP per execution. The
+   `/20` subnets have ~4,091 addresses each and there's a per-VPC Hyperplane
+   ENI quota. The S3 gateway endpoint has no bandwidth limit. Losing one AZ
+   leaves the other subnet running.
+5. **Originals pile up when it falls behind.** The raw object is deleted only
+   after its ZIP exists. If throttling or errors build a backlog, raw data sits
+   in Standard at full price, so backlog age and failed-events queue depth need
+   alarms, and the queue needs a replay procedure.
+6. **Object size.** The handler streams into `/tmp` (512 MB by default, up to
+   10 GB) with a 120 s timeout. 10 MB takes under a second. Multi-GB outputs
+   would need more ephemeral storage and a longer timeout, and anything near
+   Lambda's 15-minute limit belongs on Fargate or Batch.
+7. **Duplicates and ordering.** Notifications are at-least-once and
+   unordered. The handler is idempotent (a missing original is a no-op, a
+   replaced original isn't deleted), so duplicates only cost an extra
+   invocation.
+8. **Cold starts.** The container image takes ~1.9 s to initialise. That's
+   irrelevant for an async pipeline and rare at steady state; provisioned
+   concurrency isn't worth paying for here.
+9. **Request-priced design.** Every per-object charge (PUT, GET, HEAD,
+   lifecycle transitions) grows linearly with file count, not with bytes.
+   That's the main cost-efficiency concern at this scale; see "Fewer, bigger
+   objects" above.
