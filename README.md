@@ -105,6 +105,51 @@ aws s3 ls s3://$BUCKET/results/
 # results/sample.json.zip
 ```
 
+### Deployment check (free tier, personal account)
+
+Deployed to `ap-southeast-1` on 2026-09-14 from commit `14d9ff4`. Stack
+creation took about 5 minutes. Account id replaced with `<account>`.
+
+What was checked after the deploy:
+
+```
+bucket notification   arn:aws:lambda:ap-southeast-1:<account>:function:s3-zip-archiver-ArchiverFunction-…:live
+                      s3:ObjectCreated:*  suffix=.json
+versions              $LATEST 14d9ff4 / 1 14d9ff4, alias live -> 1
+function              PackageType Image, 1024 MB, x86_64, 2 private subnets + 1 security group
+VPC routes            10.20.0.0/16 local, pl-6fa54006 (S3) -> vpce-…
+internet gateways     0
+NAT gateways          0
+```
+
+Uploaded five copies of a 10.4 MB JSON file (synthetic video-analysis output:
+per-frame detections, bounding boxes, audio stats), one file with spaces in
+its key and one `.zip`:
+
+```
+results/2026/09/14/vid-000121.json.zip   1700604
+results/2026/09/14/vid-000122.json.zip   1700604
+results/2026/09/14/vid-000123.json.zip   1700604
+results/2026/09/14/vid-000124.json.zip   1700604
+results/2026/09/14/vid-000125.json.zip   1700604
+results/already.zip                           20   <- not processed
+results/run 7/out file.json.zip              172
+```
+
+All `.json` originals were gone within a few seconds, the unzipped content's
+sha256 matched the source file, and the failed-events queue stayed at 0.
+
+From the function's `REPORT` lines:
+
+| | duration | billed | max memory |
+|---|---|---|---|
+| cold start (init 1900 ms) | 803 ms | 2704 ms | 105 MB |
+| warm, 10.4 MB file (4 runs) | 698–733 ms, avg 715 ms | same | 111 MB |
+
+Compression ratio on this data was 6.44x (10,952,097 -> 1,700,604 bytes) and
+each invocation wrote about 507 bytes of logs. These are the numbers used in
+the cost section.
+
 ### Rolling back
 
 ```bash
