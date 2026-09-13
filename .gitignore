@@ -1,0 +1,13 @@
+# sam build output
+.aws-sam/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# local stuff
+.env
+*.zip
+samples/
