@@ -7,6 +7,14 @@ the ZIP back to the same bucket and deletes the original.
 Everything (VPC, bucket, function, failure queue, alarms) is in one stack
 defined in [`template.yaml`](template.yaml).
 
+| Task | Where to look |
+|---|---|
+| 1. Lambda that zips new objects | [How it works](#how-it-works), [`archiver/app.py`](archiver/app.py) |
+| 2. Bucket, VPC, Docker, versions | [`template.yaml`](template.yaml), [Deploying](#deploying), [Rolling back](#rolling-back) |
+| 3. Commit history and docs | `git log --graph`, this README, [CI](.github/workflows/ci.yml) |
+| 4. Monthly cost | [Final monthly figure](#final-monthly-figure), [Ways to save more](#ways-to-save-more) |
+| 5. Scalability | [Scalability and bottlenecks](#scalability-and-bottlenecks) |
+
 ## How it works
 
 ```
@@ -152,9 +160,7 @@ traceable version" true:
   the previous code hash and quietly publishing nothing.
 - `make deploy` refuses to run with uncommitted changes, so the `RELEASE_ID`
   on a version is always the commit that was actually deployed. Version 2
-  below predates this guard: it was deployed from the working tree while the
-  version fix was still uncommitted, so its `RELEASE_ID` says `3470e19` but it
-  ran the template that was committed a minute later as `23048e7`.
+  predates this guard: it ran the template later committed as `23048e7`.
 
 To get alarm emails, add `AlarmEmail=you@example.com` to the parameter
 overrides (and confirm the subscription email), or subscribe anything else to
@@ -164,22 +170,13 @@ the `AlarmTopicArn` output.
 artifact bucket and the ECR repository on first deploy and no account-specific
 values live in the repo.
 
-### Trying it
-
-```bash
-BUCKET=$(aws cloudformation describe-stacks --stack-name s3-zip-archiver \
-  --query "Stacks[0].Outputs[?OutputKey=='BucketName'].OutputValue" --output text)
-
-aws s3 cp sample.json s3://$BUCKET/results/sample.json
-sleep 10
-aws s3 ls s3://$BUCKET/results/
-# results/sample.json.zip
-```
+To try it by hand, upload any object to the `BucketName` output and
+`<key>.zip` replaces it within a few seconds.
 
 ### Deployment checks (free tier, personal account)
 
-Both deployments below went to `ap-southeast-1` in a personal account.
-Account id replaced with `<account>`. `make smoke` repeats the checks.
+All deployments went to `ap-southeast-1` in a personal account. Account id
+replaced with `<account>`. `make smoke` repeats the checks.
 
 #### First deployment, commit `14d9ff4`
 
@@ -195,22 +192,10 @@ internet gateways     0
 NAT gateways          0
 ```
 
-Uploaded five copies of a 10.4 MB JSON file (synthetic video-analysis output:
-per-frame detections, bounding boxes, audio stats), one file with spaces in
-its key and one `.zip`:
-
-```
-results/2026/09/14/vid-000121.json.zip   1700604
-results/2026/09/14/vid-000122.json.zip   1700604
-results/2026/09/14/vid-000123.json.zip   1700604
-results/2026/09/14/vid-000124.json.zip   1700604
-results/2026/09/14/vid-000125.json.zip   1700604
-results/already.zip                           20   <- not processed
-results/run 7/out file.json.zip              172
-```
-
-All `.json` originals were gone within a few seconds, the unzipped content's
-sha256 matched the source file, and the failed-events queue stayed at 0.
+Five copies of a 10.4 MB synthetic video-analysis JSON each became a
+1,700,604-byte zip, a key with spaces was archived, a `.zip` was left alone,
+originals were gone within seconds, the unzipped sha256 matched and the
+failed-events queue stayed at 0.
 
 From the function's `REPORT` lines:
 
@@ -338,10 +323,8 @@ repository and artifact bucket SAM created for the stack.
 - "Every time a new object is added" is taken literally: every new object
   triggers the function. The only objects that are not compressed are ones
   whose key already ends in `.zip`, which includes the function's own output.
-  The first version only triggered on `.json` keys, reading the task's
-  "processing result is produced in JSON" as a filter; it was changed because
-  that silently left `.ndjson`, extension-less or upper-case `.JSON` objects
-  uncompressed.
+  Filtering on `.json` would silently skip `.ndjson`, extension-less or
+  upper-case `.JSON` results.
 - One ZIP per source object, stored next to it as `<key>.zip`, holding a single
   entry named after the last segment of the key.
 - Region is `ap-southeast-1`; prices in the cost section are for that region.
@@ -362,9 +345,7 @@ repository and artifact bucket SAM created for the stack.
   output could compress better or worse, and the storage numbers scale directly
   with this ratio.
 - Files arrive evenly through the month and are kept, so month N pays for
-  N - 0.5 months of data on average. An earlier version of this section charged
-  a full month of storage in the first month and overstated the first-month
-  saving by roughly 2x.
+  N - 0.5 months of data on average.
 - On-demand prices for `ap-southeast-1` from the AWS Price List API, free tier
   ignored.
 
