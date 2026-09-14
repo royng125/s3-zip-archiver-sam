@@ -132,9 +132,26 @@ create. The bucket has a deterministic name
 Requirements: AWS CLI, SAM CLI, Docker, credentials for the target account.
 
 ```bash
-make test      # unit tests (pip install -r requirements-dev.txt first)
-make deploy    # sam build + sam deploy, ReleaseId = current git commit
+pip install -r requirements-dev.txt
+make test      # unit tests
+make deploy    # refuses uncommitted changes, then sam build + sam deploy with ReleaseId = git commit
+make smoke     # end-to-end check of the deployed stack (scripts/smoke_test.sh)
 ```
+
+Deploy through `make deploy`. Two guards keep "every deployment is a new,
+traceable version" true:
+
+- `ReleaseId` has no default, so a bare `sam deploy` fails instead of reusing
+  the previous code hash and quietly publishing nothing.
+- `make deploy` refuses to run with uncommitted changes, so the `RELEASE_ID`
+  on a version is always the commit that was actually deployed. Version 2
+  below predates this guard: it was deployed from the working tree while the
+  version fix was still uncommitted, so its `RELEASE_ID` says `3470e19` but it
+  ran the template that was committed a minute later as `23048e7`.
+
+To get alarm emails, add `AlarmEmail=you@example.com` to the parameter
+overrides (and confirm the subscription email), or subscribe anything else to
+the `AlarmTopicArn` output.
 
 `samconfig.toml` uses `resolve_s3` / `resolve_image_repos`, so SAM creates the
 artifact bucket and the ECR repository on first deploy and no account-specific
@@ -206,15 +223,12 @@ aws lambda list-versions-by-function --function-name <FunctionName> \
 make rollback VERSION=3
 ```
 
-Note that the next `make deploy` moves the alias forward again; to stay on an
-old release, redeploy that commit.
-
 Checked on the deployed stack after three deploys:
 
 ```
 Version  RELEASE_ID
 1        14d9ff4
-2        3470e19
+2        3470e19     (see the note under Deploying)
 3        23048e7     <- live
 
 make rollback VERSION=2   -> live = 2
@@ -225,6 +239,32 @@ make rollback VERSION=3   -> live = 3
 
 The `[2]` in the log stream name is the version that handled the event.
 
+What a rollback does and doesn't cover:
+
+```
+make rollback VERSION=n moves the alias. A version is a snapshot of the function:
+
+  rolled back with the version                 not part of the version (stays as currently deployed)
+  ┌────────────────────────────────────────┐   ┌───────────────────────────────────────────┐
+  │ image digest (the code)                │   │ security group rules, route table, VPC     │
+  │ environment variables, memory, timeout │   │ endpoint policy, bucket policy             │
+  │ subnet ids + security group ids        │   │ contents of the IAM role's policies        │
+  │ IAM role ARN, architecture             │   │ bucket notification, SQS queue, alarms     │
+  └────────────────────────────────────────┘   └───────────────────────────────────────────┘
+```
+
+- To undo an infrastructure change, redeploy the older commit with
+  `make deploy` instead of moving the alias.
+- A rollback happens outside CloudFormation. The stack still records the newer
+  version as the alias target, so the next `make deploy` moves the alias
+  forward again; to stay on an old release, redeploy that commit.
+- A version runs the image digest it was published with, pulled from the ECR
+  repository SAM created. If that image is deleted, for example by an ECR
+  lifecycle rule added later, the version goes into a failed state and can no
+  longer be rolled back to. The repository created here has no lifecycle
+  policy; any cleanup rule should keep the images of every version you might
+  still want.
+
 ### Removing the stack
 
 ```bash
@@ -234,7 +274,8 @@ sam delete --stack-name s3-zip-archiver
 
 The bucket has to be empty before CloudFormation can delete it. Deleting a
 VPC-attached function can take a while because Lambda releases its network
-interfaces asynchronously.
+interfaces asynchronously. `sam delete` also offers to remove the ECR
+repository and artifact bucket SAM created for the stack.
 
 ## Assumptions
 
