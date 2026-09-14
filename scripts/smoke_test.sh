@@ -80,7 +80,9 @@ aws sqs get-queue-attributes --queue-url "$QUEUE" --attribute-names ApproximateN
 
 echo "== REPORT lines since upload"
 sleep 20
+# REPORT lines are tab-separated themselves, so read them as JSON rather than text
 aws logs filter-log-events --log-group-name "/aws/lambda/$FN" --start-time "$T0" \
-  --filter-pattern REPORT --query "events[].message" --output text | tr '\t' '\n' | grep REPORT | cut -c1-160
+  --filter-pattern REPORT --query "events[].message" --output json \
+  | python3 -c "import json,sys; [print(m.strip().replace(chr(9), '  ')) for m in json.load(sys.stdin)]"
 
 echo "OK"
