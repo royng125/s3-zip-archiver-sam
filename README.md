@@ -453,27 +453,33 @@ Roughly in order of impact:
 
 ## Scalability and bottlenecks
 
-**Short answer:** it handles this volume without a redesign, but one Lambda
-invocation per object is not the most cost-efficient shape at this scale, and
-a few limits need attention before production.
+**Short answer:** the design scales to this volume, but not on the account it
+was tested on as-is, and one invocation per object is not the cheapest shape at
+this size.
 
-At 1,000,000 files per hour the steady load is ~278 events per second. At
-715 ms each that's **about 200 concurrent executions** on average, plus
-whatever the producer's burstiness adds.
+At 1,000,000 files per hour there are ~278 source events and ~278 zip events
+per second. At 743 ms per archive run that is **about 206 concurrent
+executions** for archiving and under one for the zip-triggered runs, before any
+burst from the producer.
 
-1. **Lambda concurrency quota.** The default regional limit is 1,000
-   concurrent executions shared by every function in the account. A 5x burst
-   reaches it. Throttled async events are retried for up to 6 hours
-   (`MaximumEventAgeInSeconds`) and then land in the failed-events queue.
-   Before production: request a quota increase, set reserved concurrency so
-   this function can't starve others, and alarm on `Throttles`.
-2. **The backlog is hard to see.** S3 -> Lambda is an async invoke with an
-   internal queue; the only signal is `AsyncEventAge`. Putting SQS between S3
-   and Lambda gives a visible queue depth, batching and a max concurrency
-   setting on the event source mapping. I'd do that for production.
+1. **Lambda concurrency quota, the first hard limit.** The account this was
+   deployed to has a limit of 10 concurrent executions
+   (`aws lambda get-account-settings`). At 743 ms that is about 48,000 files an
+   hour, under 5% of the target; the rest would be throttled, retried for up to
+   6 hours and then land in the failed-events queue. The quota needs raising
+   to a few hundred plus burst headroom before production. Reserved
+   concurrency, to stop this function starving others, can't be set until
+   then because Lambda always keeps 100 units unreserved. The `Throttles`
+   alarm fires as soon as throttling starts.
+2. **The async backlog is hard to see.** S3 -> Lambda is an asynchronous
+   invoke with an internal queue, and `AsyncEventAge` is the only signal; there
+   is an alarm at 15 minutes. Putting SQS between S3 and Lambda gives a visible
+   queue depth, batching and a maximum concurrency on the event source
+   mapping. At about **US$700 a month** (source and zip events through the
+   queue, receives and deletes at batch size 10) I'd do that for production.
 3. **S3 request rates per prefix.** S3 supports 3,500 PUT/COPY/POST/DELETE and
-   5,500 GET/HEAD requests per second per partitioned prefix. Steady state
-   here is ~834 write requests/s (producer PUT + zip PUT + DELETE) and ~834
+   5,500 GET/HEAD requests per second per partitioned prefix. Steady state here
+   is ~833 write requests/s (producer PUT + zip PUT + DELETE) and ~556
    GET/HEAD/s. That's fine on average, but a burst into a single prefix can
    return `503 SlowDown` while S3 re-partitions. Spreading keys across
    prefixes (date/hour or a hash) avoids it.
@@ -482,22 +488,30 @@ whatever the producer's burstiness adds.
    `/20` subnets have ~4,091 addresses each and there's a per-VPC Hyperplane
    ENI quota. The S3 gateway endpoint has no bandwidth limit. Losing one AZ
    leaves the other subnet running.
-5. **Originals pile up when it falls behind.** The raw object is deleted only
-   after its ZIP exists. If throttling or errors build a backlog, raw data sits
-   in Standard at full price, so backlog age and failed-events queue depth need
-   alarms, and the queue needs a replay procedure.
+5. **Originals pile up when processing falls behind.** The raw object is only
+   deleted after its zip exists, so throttling or errors leave raw data in
+   Standard at full price. The `AsyncEventAge` and failed-events alarms cover
+   this. Each message in the failed-events queue carries the original S3 event
+   (`requestPayload`), so it can be replayed to the `live` alias with
+   `aws lambda invoke`; the replay keeps its sequencer, so the rules in
+   "Concurrency and safe delete" make it safe.
 6. **Object size.** The handler streams into `/tmp` (512 MB by default, up to
-   10 GB) with a 120 s timeout. 10 MB takes under a second. Multi-GB outputs
-   would need more ephemeral storage and a longer timeout, and anything near
-   Lambda's 15-minute limit belongs on Fargate or Batch.
-7. **Duplicates and ordering.** Notifications are at-least-once and
-   unordered. The handler is idempotent (a missing original is a no-op, a
-   replaced original isn't deleted), so duplicates only cost an extra
-   invocation.
+   10 GB) with a 120 s timeout, and the zip is written with a single PUT, so an
+   archive can be at most 5 GB. 10 MB takes about 0.7 s. Multi-GB outputs would
+   need more ephemeral storage, a longer timeout and a multipart upload, and
+   anything near Lambda's 15-minute limit belongs on Fargate or Batch.
+7. **Concurrent and duplicate events.** Notifications are at-least-once and
+   unordered. The three interleavings that used to lose data or fail are
+   handled and tested (see "Concurrency and safe delete"); a duplicate now
+   costs one extra invocation and a HEAD. The remaining limit: an event without
+   a sequencer never replaces a zip made from another version, so in that case
+   the original stays in the bucket, visible rather than lost.
 8. **Cold starts.** The container image takes ~1.9 s to initialise. That's
    irrelevant for an async pipeline and rare at steady state; provisioned
    concurrency isn't worth paying for here.
-9. **Request-priced design.** Every per-object charge (PUT, GET, HEAD,
-   lifecycle transitions) grows linearly with file count, not with bytes.
-   That's the main cost-efficiency concern at this scale; see "Fewer, bigger
-   objects" above.
+9. **Per-object pricing.** Every per-object charge (invocations, PUT, GET,
+   HEAD, lifecycle transitions) grows with file count, not with bytes. That's
+   the main cost-efficiency concern at this scale; see "Fewer, bigger objects".
+10. **Rollback scope.** Moving the alias only rolls back the function; changes
+    to the VPC, policies or alarms need the older commit redeployed, and every
+    version depends on its image staying in ECR (see "Rolling back").
