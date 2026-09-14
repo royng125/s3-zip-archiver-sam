@@ -210,8 +210,6 @@ From the function's `REPORT` lines:
 
 #### After the hardening changes, commit `b978ca7` (version 4)
 
-Stack update took about a minute and a half including the image build.
-
 ```
 bucket notification   arn:aws:lambda:ap-southeast-1:<account>:function:s3-zip-archiver-ArchiverFunction-…:live
                       s3:ObjectCreated:*  no key filter
@@ -224,7 +222,7 @@ account concurrency   limit 10 (see Scalability)
 
 The handler relies on how S3 answers conditional requests, and the unit tests
 use moto for that. The same requests against the real bucket, on `.zip` keys so
-the function ignores them:
+the function ignores them, gave the same answers as moto:
 
 ```
 PUT    If-None-Match: *   on an existing key   -> 412 PreconditionFailed
@@ -233,8 +231,6 @@ DELETE If-Match: <wrong etag>                   -> 412 PreconditionFailed
 DELETE If-Match: <right etag>                   -> 204
 DELETE If-Match: <etag>  on a missing key       -> 404 NoSuchKey
 ```
-
-Same answers as moto.
 
 `make smoke` uploaded a JSON file, an NDJSON file, a key without an extension
 and a producer `.zip`:
@@ -259,15 +255,15 @@ Each zip carries `source-etag` and `source-sequencer` metadata and a
 `ChecksumSHA256` verified by S3. The compression ratio was 6.44x again
 (10,952,097 -> 1,700,596 bytes). These are the inputs of the cost section.
 
-#### Version 5, commit `d9cbe87`
+#### Versions 5 and 6, commits `d9cbe87` and `10882f6`
 
-The concurrency fixes (reading the event's exact version, checking the source
-is still live before replacing a zip, leaving a foreign `<key>.zip` alone)
-deployed on top: `live -> 5`, versions 1-4 kept, `make smoke` passed again. On
-the real bucket, GET and HEAD with a wrong `If-Match` return 412 and HEAD on a
-missing key returns 404, as in moto. Uploading a producer's `report.zip` and
-then `report` left both untouched, with the version `[5]` log stream reporting
-that the zip "wasn't written by the archiver".
+Version 5 added the concurrency fixes (reading the event's exact version,
+checking the source is still live before replacing a zip, leaving a foreign
+`<key>.zip` alone). On the real bucket, GET and HEAD with a wrong `If-Match`
+return 412, and HEAD or a conditional PUT on a missing key return 404, as in
+moto. A producer's `report.zip` followed by `report` left both untouched
+(logged by version `[5]`). Version 6 retries that 404 on the zip PUT. `live -> 6`,
+versions 1-5 kept, `make smoke` passed after both deploys.
 
 ### Rolling back
 
