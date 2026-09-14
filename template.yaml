@@ -3,18 +3,18 @@ Transform: AWS::Serverless-2016-10-31
 Description: Compress new objects in an S3 bucket to ZIP with a container-image Lambda
 
 Parameters:
-  SourceSuffix:
-    Type: String
-    Default: .json
-    Description: >-
-      Only objects whose key ends with this suffix trigger the function.
-      Can't be .zip, otherwise the function would re-trigger on its own output.
   ReleaseId:
     Type: String
-    Default: manual
+    AllowedPattern: ".+"
     Description: >-
-      Identifier of the release being deployed (the Makefile passes the git
-      commit). Changing it is what forces a new Lambda version on every deploy.
+      Identifier of the release being deployed; `make deploy` passes the git
+      commit. Used as AutoPublishCodeSha256, so each release publishes a new
+      Lambda version. No default on purpose: deploying without it would leave
+      the version unchanged.
+  AlarmEmail:
+    Type: String
+    Default: ""
+    Description: Optional address subscribed to the alarm topic (needs confirming from the email).
   LogRetentionDays:
     Type: Number
     Default: 14
@@ -28,11 +28,8 @@ Parameters:
     Type: String
     Default: 10.20.16.0/20
 
-Rules:
-  SuffixMustNotBeZip:
-    Assertions:
-      - Assert: !Not [!Equals [!Ref SourceSuffix, ".zip"]]
-        AssertDescription: SourceSuffix can't be .zip
+Conditions:
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
 
 Resources:
   # --- network -------------------------------------------------------------
@@ -152,6 +149,24 @@ Resources:
       # Versioning is intentionally off. With versioning on, deleting the
       # original only adds a delete marker and the bytes stay billed.
 
+  ArchiveBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArchiveBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyPlainHttp
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !Sub "arn:${AWS::Partition}:s3:::${ArchiveBucket}"
+              - !Sub "arn:${AWS::Partition}:s3:::${ArchiveBucket}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
   # Events that still fail after Lambda's async retries end up here instead
   # of being dropped.
   FailedEventsQueue:
@@ -213,16 +228,15 @@ Resources:
               Action: s3:ListBucket
               Resource: !Sub "arn:${AWS::Partition}:s3:::${AWS::StackName}-${AWS::AccountId}-${AWS::Region}"
       Events:
+        # Every new object triggers the function, as the task asks. The zips it
+        # writes back trigger it too; the handler returns immediately for those,
+        # and Lambda's recursive loop detection for S3 is a platform backstop.
+        # This costs one short invocation per zip, which the README prices.
         NewObject:
           Type: S3
           Properties:
             Bucket: !Ref ArchiveBucket
             Events: s3:ObjectCreated:*
-            Filter:
-              S3Key:
-                Rules:
-                  - Name: suffix
-                    Value: !Ref SourceSuffix
     Metadata:
       DockerContext: ./archiver
       Dockerfile: Dockerfile
@@ -236,6 +250,94 @@ Resources:
       LogGroupName: !Sub "/aws/lambda/${ArchiverFunction}"
       RetentionInDays: !Ref LogRetentionDays
 
+  # --- alarms --------------------------------------------------------------
+  # The failure modes that are otherwise silent: invocations erroring,
+  # throttling against the concurrency quota, events waiting in Lambda's
+  # internal async queue, and events given up on.
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  FunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Archiver invocations are failing (they will be retried, then sent to the failed-events queue)
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ArchiverFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+
+  FunctionThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Archiver is being throttled by the account concurrency limit
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ArchiverFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+
+  AsyncBacklogAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: S3 events have waited more than 15 minutes in Lambda's async queue; originals are piling up
+      Namespace: AWS/Lambda
+      MetricName: AsyncEventAge
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ArchiverFunction
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 900000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+
+  FailedEventsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Events were given up on and are waiting in the failed-events queue for a replay
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt FailedEventsQueue.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+
 Outputs:
   BucketName:
     Value: !Ref ArchiveBucket
@@ -245,6 +347,8 @@ Outputs:
     Value: !Ref ArchiverFunctionAliaslive
   FailedEventsQueueUrl:
     Value: !Ref FailedEventsQueue
+  AlarmTopicArn:
+    Value: !Ref AlarmTopic
   VpcId:
     Value: !Ref Vpc
   PrivateSubnetIds:

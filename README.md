@@ -1,11 +1,11 @@
 # s3-zip-archiver-sam
 
 A Lambda function, packaged as a container image and deployed with AWS SAM,
-that compresses every new JSON object uploaded to an S3 bucket into a ZIP,
-writes the ZIP back to the same bucket and deletes the original.
+that compresses every new object uploaded to an S3 bucket into a ZIP, writes
+the ZIP back to the same bucket and deletes the original.
 
-Everything (VPC, bucket, function, failure queue) is in one stack defined in
-[`template.yaml`](template.yaml).
+Everything (VPC, bucket, function, failure queue, alarms) is in one stack
+defined in [`template.yaml`](template.yaml).
 
 ## How it works
 
@@ -16,57 +16,101 @@ Everything (VPC, bucket, function, failure queue) is in one stack defined in
                            bucket  │   ┌───────────────────────────────────┐  │
                              │     │   │ ArchiverFunction:live (container) │  │
        s3:ObjectCreated:*    │     │   └───────────────┬───────────────────┘  │
-       suffix = .json  ──────┴────►│                   │ GET / PUT / DELETE   │
+       every new object ─────┴────►│                   │ GET/HEAD/PUT/DELETE  │
                                    │           S3 gateway endpoint            │
                                    └───────────────────┼──────────────────────┘
                                                        ▼
-                                   results/abc.json.zip written, results/abc.json deleted
+                             results/abc.json.zip written, results/abc.json deleted
+                             (the new .zip triggers the function too; it returns at once)
 
-   failed after retries ──► SQS FailedEventsQueue
+   failed after retries ──► SQS FailedEventsQueue ──► CloudWatch alarm ──► SNS
 ```
 
-1. An object ending in `.json` lands in the bucket and S3 invokes the `live`
-   alias of the function asynchronously.
-2. The function streams the object into a ZIP in `/tmp` and uploads it as
-   `<original key>.zip`.
-3. It checks the ZIP in S3 has the size it wrote, checks the original hasn't
-   been replaced in the meantime (ETag), and only then deletes the original.
-4. If an invocation keeps failing, Lambda retries twice and then sends the
-   event to the SQS queue.
+1. Any new object lands in the bucket and S3 invokes the `live` alias of the
+   function asynchronously. Keys ending in `.zip` return immediately.
+2. The function streams the object into a ZIP in `/tmp`.
+3. It looks at the existing `<key>.zip`, if any. A zip made from this exact
+   source version means the work was already done; a zip made from a newer
+   upload means this event is stale and the function stops. Otherwise it
+   uploads the zip with a conditional PUT and a SHA-256 checksum, recording the
+   source ETag and the event's sequencer in the zip's metadata.
+4. It deletes the original with a conditional delete (`If-Match` on the ETag it
+   read), so a version uploaded in the meantime is never removed.
+5. If an invocation keeps failing, Lambda retries twice and then sends the
+   event to the SQS queue, which raises an alarm.
 
 ## Repository layout
 
 ```
-archiver/app.py           handler
-archiver/Dockerfile       image based on public.ecr.aws/lambda/python:3.12
-archiver/requirements.txt runtime deps (pinned boto3)
-tests/test_app.py         unit tests against moto
-template.yaml             VPC, bucket, function, queue, log group
-samconfig.toml            stack name / region / deploy defaults
-Makefile                  test, build, deploy, rollback
+archiver/app.py             handler
+archiver/Dockerfile         image based on public.ecr.aws/lambda/python:3.12
+archiver/requirements.txt   runtime deps (pinned boto3)
+tests/test_app.py           unit tests against moto, including the race conditions below
+template.yaml               VPC, bucket, function, queue, alarms, log group
+samconfig.toml              stack name / region / deploy defaults
+Makefile                    test, build, deploy, smoke, rollback
+scripts/smoke_test.sh       end-to-end check of a deployed stack
+scripts/cost_estimate.py    reproduces the cost analysis
+.github/workflows/ci.yml    tests, cfn-lint and image build on every push
 ```
 
 ## Design notes
 
-**No trigger loop.** The ZIP is written to the same bucket, so a notification
-on every object would invoke the function on its own output forever. The
-notification is filtered on the `SourceSuffix` parameter (`.json` by default),
-a template rule refuses `.zip` as a value, and the handler also ignores `.zip`
-keys in case the filter is ever widened by hand.
+**No trigger loop.** The task asks for the function to run every time a new
+object is added, and the ZIPs it writes back are new objects too. The
+notification has no key filter; the first thing the handler does is return for
+keys ending in `.zip`, before any S3 call. If that check were ever broken,
+Lambda's recursive loop detection for S3 stops the chain after roughly 16
+invocations, but that's a backstop, not the design. The price is one very short
+extra invocation per archived object, included in the cost section. A
+producer's own `.zip` uploads are skipped the same way, which is fine since
+they're already compressed.
 
 **Private subnets without NAT.** The function only needs S3, so the VPC has no
 internet gateway and no NAT gateway. S3 traffic goes through a gateway
 endpoint, which is free, and the endpoint policy only allows this stack's
-bucket. Logs don't need a network path: Lambda ships them to CloudWatch
-outside the VPC. See the cost section for why NAT would be a very expensive
-choice here.
+bucket. The bucket policy rejects any request not made over TLS. Logs don't
+need a network path: Lambda ships them to CloudWatch outside the VPC. See the
+cost section for why NAT would be a very expensive choice here.
 
-**Safe delete.** S3 delivers notifications at least once and a producer might
-re-upload the same key. So the handler treats a missing source object as
-"already done", verifies the uploaded ZIP before deleting, and does not delete
-an original whose ETag changed while it was being archived. Bucket versioning
-is deliberately off; with it on, "deleting" the original would only add a
-delete marker and save nothing.
+**Concurrency and safe delete.** S3 notifications are delivered at least once
+and in no guaranteed order, and a producer can upload a key again while the
+previous version is still being archived. An earlier version of the handler
+got three interleavings wrong. Each one is now reproduced by a test in
+`tests/test_app.py`:
+
+```
+1. Overwrite between the ETag check and the delete  -> the new version was deleted, never zipped
+   A (v1)    GET v1 ── zip ── PUT zip ── HEAD: etag ok ─────────── DELETE  ✗ deletes v2
+   producer                                          PUT v2 ──┘
+   now       DELETE If-Match: etag(v1)  -> 412, v2 stays, its own event archives it
+
+2. Two deliveries of the same event racing          -> spurious errors and retries
+   A1        ... DELETE ─ 204
+   A2        ... HEAD original ─ 404, unhandled
+   now       DELETE If-Match ─ 404 -> "missing", no error
+
+3. A slow invocation for an older version           -> old content put back over the new zip
+   A (v1)    GET v1 ──────────────── slow ─────────────────── PUT zip(v1)  ✗ overwrites zip(v2)
+   B (v2)           GET v2 ── PUT zip(v2) ── DELETE v2
+   now       A sees a zip made from a newer sequencer: writes nothing, deletes nothing
+```
+
+The rules the handler follows:
+
+| situation | action |
+|---|---|
+| original is gone | nothing to do (`missing`) |
+| zip exists, made from this exact source ETag | skip the upload, run the conditional delete; this is how a retry after failing between upload and delete finishes |
+| zip exists, made from a newer event sequencer | stop, keep everything (`stale`) |
+| no zip, or zip from an older event | PUT with `If-None-Match: *` / `If-Match: <zip etag>` so two writers can't both win, then conditional delete |
+| original changed before the delete | leave it (`kept-original`); its own event handles it |
+
+Limits of this: an event without a sequencer (a manual invoke, a batch job)
+never replaces a zip made from a different version; and the zip is a single
+PUT, so one archive can be at most 5 GB. Bucket versioning is deliberately off;
+with it on, "deleting" the original would only add a delete marker and save
+nothing.
 
 **Versions and rollback.** `AutoPublishAlias: live` publishes an immutable
 version and S3 always invokes the alias, never `$LATEST`. The Makefile passes
@@ -88,9 +132,26 @@ create. The bucket has a deterministic name
 Requirements: AWS CLI, SAM CLI, Docker, credentials for the target account.
 
 ```bash
-make test      # unit tests (pip install -r requirements-dev.txt first)
-make deploy    # sam build + sam deploy, ReleaseId = current git commit
+pip install -r requirements-dev.txt
+make test      # unit tests
+make deploy    # refuses uncommitted changes, then sam build + sam deploy with ReleaseId = git commit
+make smoke     # end-to-end check of the deployed stack (scripts/smoke_test.sh)
 ```
+
+Deploy through `make deploy`. Two guards keep "every deployment is a new,
+traceable version" true:
+
+- `ReleaseId` has no default, so a bare `sam deploy` fails instead of reusing
+  the previous code hash and quietly publishing nothing.
+- `make deploy` refuses to run with uncommitted changes, so the `RELEASE_ID`
+  on a version is always the commit that was actually deployed. Version 2
+  below predates this guard: it was deployed from the working tree while the
+  version fix was still uncommitted, so its `RELEASE_ID` says `3470e19` but it
+  ran the template that was committed a minute later as `23048e7`.
+
+To get alarm emails, add `AlarmEmail=you@example.com` to the parameter
+overrides (and confirm the subscription email), or subscribe anything else to
+the `AlarmTopicArn` output.
 
 `samconfig.toml` uses `resolve_s3` / `resolve_image_repos`, so SAM creates the
 artifact bucket and the ECR repository on first deploy and no account-specific
@@ -108,12 +169,14 @@ aws s3 ls s3://$BUCKET/results/
 # results/sample.json.zip
 ```
 
-### Deployment check (free tier, personal account)
+### Deployment checks (free tier, personal account)
 
-Deployed to `ap-southeast-1` on 2026-09-14 from commit `14d9ff4`. Stack
-creation took about 5 minutes. Account id replaced with `<account>`.
+Both deployments below went to `ap-southeast-1` in a personal account.
+Account id replaced with `<account>`. `make smoke` repeats the checks.
 
-What was checked after the deploy:
+#### First deployment, commit `14d9ff4`
+
+Stack creation took about 5 minutes. What was checked after the deploy:
 
 ```
 bucket notification   arn:aws:lambda:ap-southeast-1:<account>:function:s3-zip-archiver-ArchiverFunction-…:live
@@ -149,9 +212,56 @@ From the function's `REPORT` lines:
 | cold start (init 1900 ms) | 803 ms | 2704 ms | 105 MB |
 | warm, 10.4 MB file (4 runs) | 698–733 ms, avg 715 ms | same | 111 MB |
 
-Compression ratio on this data was 6.44x (10,952,097 -> 1,700,604 bytes) and
-each invocation wrote about 507 bytes of logs. These are the numbers used in
-the cost section.
+#### After the hardening changes, commit `b978ca7` (version 4)
+
+Stack update took about a minute and a half including the image build.
+
+```
+bucket notification   arn:aws:lambda:ap-southeast-1:<account>:function:s3-zip-archiver-ArchiverFunction-…:live
+                      s3:ObjectCreated:*  no key filter
+versions              1 14d9ff4 / 2 3470e19 / 3 23048e7 / 4 b978ca7, alias live -> 4
+alarms                Errors, Throttles, AsyncEventAge, failed-events queue: all OK
+bucket policy         DenyPlainHttp (aws:SecureTransport = false)
+VPC routes            10.20.0.0/16 local, pl-6fa54006 (S3); internet gateways 0; NAT gateways 0
+account concurrency   limit 10 (see Scalability)
+```
+
+The handler relies on how S3 answers conditional requests, and the unit tests
+use moto for that. The same requests against the real bucket, on `.zip` keys so
+the function ignores them:
+
+```
+PUT    If-None-Match: *   on an existing key   -> 412 PreconditionFailed
+PUT    If-Match: <wrong etag>                   -> 412 PreconditionFailed
+DELETE If-Match: <wrong etag>                   -> 412 PreconditionFailed
+DELETE If-Match: <right etag>                   -> 204
+DELETE If-Match: <etag>  on a missing key       -> 404 NoSuchKey
+```
+
+Same answers as moto.
+
+`make smoke` uploaded a JSON file, an NDJSON file, a key without an extension
+and a producer `.zip`:
+
+```
+smoke/…/lines.ndjson.zip
+smoke/…/no extension.zip
+smoke/…/producer.zip          <- left alone
+smoke/…/result.json.zip       unzipped entry has the same sha256 as the upload
+failed-events queue           0
+```
+
+Then twenty 10.4 MB uploads, one at a time because of the concurrency limit,
+with the `REPORT` lines grouped by whether the invocation archived something:
+
+| invocation | runs | billed duration | max memory | log bytes |
+|---|---|---|---|---|
+| archive, 10.4 MB JSON | 20 | avg 743 ms (median 699, min 676, max 1,539) | 114 MB | 464 |
+| triggered by its own zip | 20 | avg 2 ms | 114 MB | 258 |
+
+Each zip carries `source-etag` and `source-sequencer` metadata and a
+`ChecksumSHA256` verified by S3. The compression ratio was 6.44x again
+(10,952,097 -> 1,700,596 bytes). These are the inputs of the cost section.
 
 ### Rolling back
 
@@ -162,15 +272,12 @@ aws lambda list-versions-by-function --function-name <FunctionName> \
 make rollback VERSION=3
 ```
 
-Note that the next `make deploy` moves the alias forward again; to stay on an
-old release, redeploy that commit.
-
 Checked on the deployed stack after three deploys:
 
 ```
 Version  RELEASE_ID
 1        14d9ff4
-2        3470e19
+2        3470e19     (see the note under Deploying)
 3        23048e7     <- live
 
 make rollback VERSION=2   -> live = 2
@@ -181,6 +288,32 @@ make rollback VERSION=3   -> live = 3
 
 The `[2]` in the log stream name is the version that handled the event.
 
+What a rollback does and doesn't cover:
+
+```
+make rollback VERSION=n moves the alias. A version is a snapshot of the function:
+
+  rolled back with the version                 not part of the version (stays as currently deployed)
+  ┌────────────────────────────────────────┐   ┌───────────────────────────────────────────┐
+  │ image digest (the code)                │   │ security group rules, route table, VPC     │
+  │ environment variables, memory, timeout │   │ endpoint policy, bucket policy             │
+  │ subnet ids + security group ids        │   │ contents of the IAM role's policies        │
+  │ IAM role ARN, architecture             │   │ bucket notification, SQS queue, alarms     │
+  └────────────────────────────────────────┘   └───────────────────────────────────────────┘
+```
+
+- To undo an infrastructure change, redeploy the older commit with
+  `make deploy` instead of moving the alias.
+- A rollback happens outside CloudFormation. The stack still records the newer
+  version as the alias target, so the next `make deploy` moves the alias
+  forward again; to stay on an old release, redeploy that commit.
+- A version runs the image digest it was published with, pulled from the ECR
+  repository SAM created. If that image is deleted, for example by an ECR
+  lifecycle rule added later, the version goes into a failed state and can no
+  longer be rolled back to. The repository created here has no lifecycle
+  policy; any cleanup rule should keep the images of every version you might
+  still want.
+
 ### Removing the stack
 
 ```bash
@@ -190,14 +323,20 @@ sam delete --stack-name s3-zip-archiver
 
 The bucket has to be empty before CloudFormation can delete it. Deleting a
 VPC-attached function can take a while because Lambda releases its network
-interfaces asynchronously.
+interfaces asynchronously. `sam delete` also offers to remove the ECR
+repository and artifact bucket SAM created for the stack.
 
 ## Assumptions
 
-- "Every time a new object is added" is read as every new *source* object.
-  The ZIPs the function writes are objects too, and processing them would
-  loop, so the trigger is limited to the configured suffix.
-- One ZIP per source object, stored next to it as `<key>.zip`.
+- "Every time a new object is added" is taken literally: every new object
+  triggers the function. The only objects that are not compressed are ones
+  whose key already ends in `.zip`, which includes the function's own output.
+  The first version only triggered on `.json` keys, reading the task's
+  "processing result is produced in JSON" as a filter; it was changed because
+  that silently left `.ndjson`, extension-less or upper-case `.JSON` objects
+  uncompressed.
+- One ZIP per source object, stored next to it as `<key>.zip`, holding a single
+  entry named after the last segment of the key.
 - Region is `ap-southeast-1`; prices in the cost section are for that region.
 
 ## Cost analysis
@@ -205,60 +344,79 @@ interfaces asynchronously.
 ### Assumptions
 
 - 1,000,000 files per hour x 730 hours = **730 million files a month**,
-  10 MB each, one invocation per file.
-- Duration and log volume are the measured values from the deployment above:
-  715 ms average at 1024 MB, ~507 bytes of logs per invocation.
+  10 MB each.
+- Every archived file means two invocations: the archive run, and a short one
+  when its own zip triggers the function.
+- Durations and log sizes are the measured values from the second deployment:
+  743 ms and 464 bytes per archive run, 2 ms and 258 bytes per zip-triggered
+  run, at 1024 MB. That's twenty runs on synthetic data, one at a time; real
+  files under real concurrency could be slower.
 - Compression ratio 6.44x, measured on synthetic JSON. Real video-analysis
   output could compress better or worse, and the storage numbers scale directly
   with this ratio.
+- Files arrive evenly through the month and are kept, so month N pays for
+  N - 0.5 months of data on average. An earlier version of this section charged
+  a full month of storage in the first month and overstated the first-month
+  saving by roughly 2x.
 - On-demand prices for `ap-southeast-1` from the AWS Price List API, free tier
-  ignored. The producer's own uploads (and their PUT requests) already exist
-  today, so they're not counted as part of this feature.
+  ignored.
 
 `scripts/cost_estimate.py` reproduces every number below:
 
 ```bash
-python scripts/cost_estimate.py --duration-ms 715 --ratio 6.44 --log-bytes 507
+python scripts/cost_estimate.py --duration-ms 743 --ratio 6.44 --log-bytes 464 \
+  --skip-duration-ms 2 --skip-log-bytes 258
 ```
 
 ### What the feature costs to run
 
+The same every month:
+
 | item | volume per month | USD / month |
 |---|---|---|
-| Lambda requests | 730M x $0.20 per 1M | 146 |
-| Lambda compute, x86_64 | 521.95M GB-s x $0.0000166667 | 8,699 |
+| Lambda requests | 1,460M (archive + zip-triggered) x $0.20 per 1M | 292 |
+| Lambda compute, archive runs, x86_64 | 542.4M GB-s x $0.0000166667 | 9,040 |
+| Lambda compute, zip-triggered runs | 1.46M GB-s | 24 |
 | S3 GET, read original | 730M x $0.0004 per 1K | 292 |
+| S3 HEAD, check for an existing zip | 730M x $0.0004 per 1K | 292 |
 | S3 PUT, write zip | 730M x $0.005 per 1K | 3,650 |
-| S3 HEAD x2, verify zip + check original | 1,460M x $0.0004 per 1K | 584 |
 | S3 DELETE | free | 0 |
-| CloudWatch Logs ingestion | ~345 GB x $0.70 | 241 |
+| CloudWatch Logs ingestion | ~491 GB x $0.70 | 344 |
+| CloudWatch alarms | 4 x $0.10 | < 1 |
 | S3 gateway endpoint, in-region transfer | free | 0 |
-| ECR image (207 MB) and SQS (failures only) | | < 1 |
-| **total** | | **~13,600** |
+| ECR image (207 MB), SQS and SNS (failures only) | | < 1 |
+| **total** | | **~13,934** |
 
-Cold starts add a little on top: the image's 1.9 s init is billed, but at
-~200 warm environments running continuously they are a very small share of
-invocations.
+That is about $0.000019 per file, or $19 per million files. Cold starts add a
+little on top: the image's 1.9 s init is billed, but at ~200 warm environments
+running continuously they are a very small share of invocations.
 
-### What it saves
+### Monthly bill with and without the feature
 
-One month of output is 6.80 PiB of raw JSON or 1.06 PiB zipped. Kept in
-S3 Standard, that month of data costs:
+Both columns include the producer's 730M uploads ($3,650). "Without" keeps the
+raw JSON in S3 Standard; "with" adds the processing above and keeps only the
+zips.
 
-| | size | USD per month it is stored |
+| month | without feature | with feature |
 |---|---|---|
-| raw JSON (today) | 6.80 PiB | 164,528 |
-| zipped | 1.06 PiB | 26,024 |
-| **difference** | | **138,504** |
+| 1 | 86,196 | **30,878** |
+| 2 | 250,160 | 56,338 |
+| 3 | 414,125 | 81,798 |
+| 6 | 906,020 | 158,179 |
+| 12 | 1,889,809 | 310,942 |
+| each further month | +163,965 | +25,460 |
 
-### Monthly figure
+### Final monthly figure
 
-- **The feature itself costs about US$13,600 per month.**
-- In the first month it removes about US$138,500 of storage, so the bill is
-  roughly **US$124,900 lower** than without it.
-- The gap widens every month because stored data accumulates while the
-  processing cost stays flat. After a year of retention, storage would be
-  around US$312K/month zipped against about US$1.97M/month raw.
+**US$30,878 for the first month, then about US$25,460 more each month for as
+long as the archives are kept.** US$13,934 of that is the processing this
+feature adds; the rest is the producer's uploads and the zip storage. Without
+the feature the first month costs US$86,196 and grows by US$163,965 a month.
+
+The bill has no single steady-state value while storage keeps growing. With a
+retention or lifecycle rule that caps what is kept, it levels off: keeping
+twelve months in S3 Standard, just above the month-12 row, about **US$311K a
+month with the feature against US$1.89M without**.
 
 ### Ways to save more
 
@@ -268,51 +426,60 @@ Roughly in order of impact:
    NAT gateway would add about **US$486,000 per month** in data processing,
    more than everything else combined.
 2. **Compress before uploading.** If the on-prem exporter writes ZIP (or
-   gzip/zstd) itself, the whole ~US$13.6K of processing disappears and upload
+   gzip/zstd) itself, the ~US$13.9K of processing disappears and upload
    bandwidth drops about 6x. This Lambda is the right tool when the producer
    can't be changed.
-3. **Move old archives to a colder class.** Zipped data in Glacier Instant
-   Retrieval costs ~US$5,500 per month of data instead of ~US$26,000 in
+3. **Move older archives to a colder class.** One month of zips costs
+   ~US$5,500 a month in Glacier Instant Retrieval instead of ~US$26,000 in
    Standard. Deep Archive is ~US$2,200, but lifecycle transitions are charged
-   per object (US$43,800 for 730M objects), there's a 180-day minimum and
-   retrieval takes hours, so it only pays off for data that is almost never
-   read.
-4. **Fewer, bigger objects.** PUT, HEAD and especially lifecycle transition
-   costs are per object. Bundling files into one archive per minute or per
-   video (S3 -> SQS -> batch consumer) divides those line items by the
-   bundle size.
-5. **arm64.** Graviton compute is 20% cheaper here, about US$1,740/month
-   saved. Needs the image built for arm64.
-6. **Right-size memory.** Max memory used was 111 MB out of 1024 MB. Lowering
+   per object (US$43,800 for a month's 730M objects), there's a 180-day minimum
+   and retrieval takes hours, so it only pays off for data that is almost
+   never read.
+4. **Fewer, bigger objects.** Lambda requests (US$292), PUTs (US$3,650),
+   GET/HEAD (US$584) and especially lifecycle transitions are charged per
+   object. Bundling files into one archive per minute or per video
+   (S3 -> SQS -> batch consumer) divides those line items by the bundle size.
+5. **arm64.** Graviton compute is 20% cheaper, about US$1,813 a month. Needs
+   the image built for arm64, which the CI job could do with a multi-arch
+   build.
+6. **Right-size memory.** Max memory used was 114 MB out of 1024 MB. Lowering
    memory also lowers CPU, so duration will go up; the cheapest setting has to
    be measured (e.g. with AWS Lambda Power Tuning). Not measured here.
-7. **Smaller wins.** Log successful archives at DEBUG in production, buy a
-   Compute Savings Plan for the Lambda spend, and drop the verification HEAD
-   calls (US$584) if the PUT response is considered enough.
+7. **Filter the trigger if every object isn't really needed.** Restricting the
+   notification to known source keys removes the zip-triggered runs, about
+   US$293 a month.
+8. **Smaller wins.** Log successful archives at DEBUG in production and buy a
+   Compute Savings Plan for the Lambda spend.
 
 ## Scalability and bottlenecks
 
-**Short answer:** it handles this volume without a redesign, but one Lambda
-invocation per object is not the most cost-efficient shape at this scale, and
-a few limits need attention before production.
+**Short answer:** the design scales to this volume, but not on the account it
+was tested on as-is, and one invocation per object is not the cheapest shape at
+this size.
 
-At 1,000,000 files per hour the steady load is ~278 events per second. At
-715 ms each that's **about 200 concurrent executions** on average, plus
-whatever the producer's burstiness adds.
+At 1,000,000 files per hour there are ~278 source events and ~278 zip events
+per second. At 743 ms per archive run that is **about 206 concurrent
+executions** for archiving and under one for the zip-triggered runs, before any
+burst from the producer.
 
-1. **Lambda concurrency quota.** The default regional limit is 1,000
-   concurrent executions shared by every function in the account. A 5x burst
-   reaches it. Throttled async events are retried for up to 6 hours
-   (`MaximumEventAgeInSeconds`) and then land in the failed-events queue.
-   Before production: request a quota increase, set reserved concurrency so
-   this function can't starve others, and alarm on `Throttles`.
-2. **The backlog is hard to see.** S3 -> Lambda is an async invoke with an
-   internal queue; the only signal is `AsyncEventAge`. Putting SQS between S3
-   and Lambda gives a visible queue depth, batching and a max concurrency
-   setting on the event source mapping. I'd do that for production.
+1. **Lambda concurrency quota, the first hard limit.** The account this was
+   deployed to has a limit of 10 concurrent executions
+   (`aws lambda get-account-settings`). At 743 ms that is about 48,000 files an
+   hour, under 5% of the target; the rest would be throttled, retried for up to
+   6 hours and then land in the failed-events queue. The quota needs raising
+   to a few hundred plus burst headroom before production. Reserved
+   concurrency, to stop this function starving others, can't be set until
+   then because Lambda always keeps 100 units unreserved. The `Throttles`
+   alarm fires as soon as throttling starts.
+2. **The async backlog is hard to see.** S3 -> Lambda is an asynchronous
+   invoke with an internal queue, and `AsyncEventAge` is the only signal; there
+   is an alarm at 15 minutes. Putting SQS between S3 and Lambda gives a visible
+   queue depth, batching and a maximum concurrency on the event source
+   mapping. At about **US$700 a month** (source and zip events through the
+   queue, receives and deletes at batch size 10) I'd do that for production.
 3. **S3 request rates per prefix.** S3 supports 3,500 PUT/COPY/POST/DELETE and
-   5,500 GET/HEAD requests per second per partitioned prefix. Steady state
-   here is ~834 write requests/s (producer PUT + zip PUT + DELETE) and ~834
+   5,500 GET/HEAD requests per second per partitioned prefix. Steady state here
+   is ~833 write requests/s (producer PUT + zip PUT + DELETE) and ~556
    GET/HEAD/s. That's fine on average, but a burst into a single prefix can
    return `503 SlowDown` while S3 re-partitions. Spreading keys across
    prefixes (date/hour or a hash) avoids it.
@@ -321,22 +488,71 @@ whatever the producer's burstiness adds.
    `/20` subnets have ~4,091 addresses each and there's a per-VPC Hyperplane
    ENI quota. The S3 gateway endpoint has no bandwidth limit. Losing one AZ
    leaves the other subnet running.
-5. **Originals pile up when it falls behind.** The raw object is deleted only
-   after its ZIP exists. If throttling or errors build a backlog, raw data sits
-   in Standard at full price, so backlog age and failed-events queue depth need
-   alarms, and the queue needs a replay procedure.
+5. **Originals pile up when processing falls behind.** The raw object is only
+   deleted after its zip exists, so throttling or errors leave raw data in
+   Standard at full price. The `AsyncEventAge` and failed-events alarms cover
+   this. Each message in the failed-events queue carries the original S3 event
+   (`requestPayload`), so it can be replayed to the `live` alias with
+   `aws lambda invoke`; the replay keeps its sequencer, so the rules in
+   "Concurrency and safe delete" make it safe.
 6. **Object size.** The handler streams into `/tmp` (512 MB by default, up to
-   10 GB) with a 120 s timeout. 10 MB takes under a second. Multi-GB outputs
-   would need more ephemeral storage and a longer timeout, and anything near
-   Lambda's 15-minute limit belongs on Fargate or Batch.
-7. **Duplicates and ordering.** Notifications are at-least-once and
-   unordered. The handler is idempotent (a missing original is a no-op, a
-   replaced original isn't deleted), so duplicates only cost an extra
-   invocation.
+   10 GB) with a 120 s timeout, and the zip is written with a single PUT, so an
+   archive can be at most 5 GB. 10 MB takes about 0.7 s. Multi-GB outputs would
+   need more ephemeral storage, a longer timeout and a multipart upload, and
+   anything near Lambda's 15-minute limit belongs on Fargate or Batch.
+7. **Concurrent and duplicate events.** Notifications are at-least-once and
+   unordered. The three interleavings that used to lose data or fail are
+   handled and tested (see "Concurrency and safe delete"); a duplicate now
+   costs one extra invocation and a HEAD. The remaining limit: an event without
+   a sequencer never replaces a zip made from another version, so in that case
+   the original stays in the bucket, visible rather than lost.
 8. **Cold starts.** The container image takes ~1.9 s to initialise. That's
    irrelevant for an async pipeline and rare at steady state; provisioned
    concurrency isn't worth paying for here.
-9. **Request-priced design.** Every per-object charge (PUT, GET, HEAD,
-   lifecycle transitions) grows linearly with file count, not with bytes.
-   That's the main cost-efficiency concern at this scale; see "Fewer, bigger
-   objects" above.
+9. **Per-object pricing.** Every per-object charge (invocations, PUT, GET,
+   HEAD, lifecycle transitions) grows with file count, not with bytes. That's
+   the main cost-efficiency concern at this scale; see "Fewer, bigger objects".
+10. **Rollback scope.** Moving the alias only rolls back the function; changes
+    to the VPC, policies or alarms need the older commit redeployed, and every
+    version depends on its image staying in ECR (see "Rolling back").
+
+## Existing objects (backfill)
+
+The introduction says the buckets are already large. The bucket notification
+only sees objects uploaded after the stack exists, so the data already there
+needs a one-off job. Not implemented here; the plan:
+
+```
+S3 Inventory manifest ──► drop *.zip and keys that already have <key>.zip ──► S3 Batch Operations
+                                                                              "Invoke AWS Lambda" -> ArchiverFunction:live
+                                                                              one job per prefix, run off-peak
+```
+
+1. Turn on S3 Inventory for the bucket, or let Batch Operations generate the
+   manifest from a prefix.
+2. Drop keys that already end in `.zip` and keys whose `<key>.zip` already
+   exists (Athena over the inventory works well for this).
+3. Run a Batch Operations job that invokes the `live` alias for each key.
+   Batch Operations sends its own payload (`tasks[].s3Key`) and expects a result
+   per task, so the handler needs a small adapter for that format, which isn't
+   written yet. These invocations carry no sequencer, so by the rules above they
+   never replace a zip made from another version and can run while live
+   traffic continues.
+4. Split jobs by prefix and run them when the producer is quiet. Batch
+   Operations uses the same account concurrency as live traffic: with this
+   account's limit of 10, 100 million objects would take about 86 days; at 250
+   concurrent executions, about 3.4 days.
+
+Example for **100 million existing 10 MB objects** (954 TiB), with the same
+per-file cost as above:
+
+| item | USD |
+|---|---|
+| processing, $19.09 per million files | 1,909 |
+| Batch Operations, $1.00 per million objects + $0.25 per job | ~100 |
+| S3 Inventory ($0.0028 per million listed) or a generated manifest ($0.015 per million) | < 2 |
+| **one-off total** | **~2,010** |
+
+Afterwards those objects take 148 TiB instead of 954 TiB, and their storage
+drops from **US$23,024 to US$3,691 a month, saving US$19,334 a month**. The
+backfill pays for itself in about three days.
