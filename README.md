@@ -515,3 +515,44 @@ burst from the producer.
 10. **Rollback scope.** Moving the alias only rolls back the function; changes
     to the VPC, policies or alarms need the older commit redeployed, and every
     version depends on its image staying in ECR (see "Rolling back").
+
+## Existing objects (backfill)
+
+The introduction says the buckets are already large. The bucket notification
+only sees objects uploaded after the stack exists, so the data already there
+needs a one-off job. Not implemented here; the plan:
+
+```
+S3 Inventory manifest ──► drop *.zip and keys that already have <key>.zip ──► S3 Batch Operations
+                                                                              "Invoke AWS Lambda" -> ArchiverFunction:live
+                                                                              one job per prefix, run off-peak
+```
+
+1. Turn on S3 Inventory for the bucket, or let Batch Operations generate the
+   manifest from a prefix.
+2. Drop keys that already end in `.zip` and keys whose `<key>.zip` already
+   exists (Athena over the inventory works well for this).
+3. Run a Batch Operations job that invokes the `live` alias for each key.
+   Batch Operations sends its own payload (`tasks[].s3Key`) and expects a result
+   per task, so the handler needs a small adapter for that format, which isn't
+   written yet. These invocations carry no sequencer, so by the rules above they
+   never replace a zip made from another version and can run while live
+   traffic continues.
+4. Split jobs by prefix and run them when the producer is quiet. Batch
+   Operations uses the same account concurrency as live traffic: with this
+   account's limit of 10, 100 million objects would take about 86 days; at 250
+   concurrent executions, about 3.4 days.
+
+Example for **100 million existing 10 MB objects** (954 TiB), with the same
+per-file cost as above:
+
+| item | USD |
+|---|---|
+| processing, $19.09 per million files | 1,909 |
+| Batch Operations, $1.00 per million objects + $0.25 per job | ~100 |
+| S3 Inventory ($0.0028 per million listed) or a generated manifest ($0.015 per million) | < 2 |
+| **one-off total** | **~2,010** |
+
+Afterwards those objects take 148 TiB instead of 954 TiB, and their storage
+drops from **US$23,024 to US$3,691 a month, saving US$19,334 a month**. The
+backfill pays for itself in about three days.
