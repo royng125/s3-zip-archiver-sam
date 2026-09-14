@@ -70,8 +70,8 @@ keys ending in `.zip`, before any S3 call. If that check were ever broken,
 Lambda's recursive loop detection for S3 stops the chain after roughly 16
 invocations, but that's a backstop, not the design. The price is one very short
 extra invocation per archived object, included in the cost section. A
-producer's own `.zip` uploads are skipped the same way. If a producer uploads
-both `report` and `report.zip`, that zip is left alone (see below).
+producer's own `.zip` uploads are skipped the same way. A `report.zip` that
+already exists when `report` is archived is left alone (see below).
 
 **Private subnets without NAT.** The function only needs S3, so the VPC has no
 internet gateway and no NAT gateway. S3 traffic goes through a gateway
@@ -88,7 +88,7 @@ each reproduced by a test in `tests/test_app.py`:
 ```
 situation                                  how it's handled
 ─────────────────────────────────────────  ─────────────────────────────────────────────────
-same event delivered twice                 second DELETE If-Match gets 404 -> "missing"
+same event delivered twice                 original already gone (GET or DELETE 404) -> "missing"
 new upload between our read and delete     DELETE If-Match: etag we read -> 412, new version kept
 slow invocation for an older version       zip already made from a newer event -> write nothing
 late event, key overwritten since          GET If-Match: event eTag -> 412 -> "superseded"
@@ -112,17 +112,21 @@ The rules, in the order the handler applies them:
 
 - With each result key written once (for example one key per video), the only
   concurrency is duplicate delivery, which is fully handled. With repeated
-  writes to one key, a write landing in the milliseconds between the source
-  check and the zip PUT can still be overwritten.
+  writes, one case remains: re-uploading exactly the content the zip already
+  holds, while a slower invocation for another version sits between its source
+  check and its zip upload (seconds, with SDK retries), loses that re-upload.
 - Events without a sequencer (manual invoke, batch job) never replace a zip
   made from another version; the original stays in the bucket.
 - A `<key>.zip` the archiver didn't write is never overwritten, so `<key>`
-  stays uncompressed next to it.
+  stays uncompressed next to it. The reverse can't be guarded in the function:
+  a producer uploading `<key>.zip` after `<key>` was archived replaces the zip.
 - Keys over 1,020 bytes: `<key>.zip` passes S3's 1,024-byte key limit, the PUT
   fails and the event ends in the failed-events queue with the original kept.
 - A DELETE answered with 409 counts as `kept-original`; if the conflicting
   write then failed, no new event arrives and the original stays.
 - An archive is a single PUT, so at most 5 GB.
+- Objects encrypted with SSE-C, or uploaded straight into a Glacier storage
+  class, can't be read; they fail every retry and end in the failed-events queue.
 
 Bucket versioning is deliberately off; with it on, "deleting" the original
 would only add a delete marker and save nothing.
@@ -502,8 +506,8 @@ burst from the producer.
 7. **Concurrent and duplicate events.** Notifications are at-least-once and
    unordered. A duplicate delivery costs one extra invocation and is handled;
    with each key written once, that is the only concurrency there is. Repeated
-   writes to the same key are handled too, except for the millisecond window
-   under "Known limitations".
+   writes to the same key are handled too, except for the one case under
+   "Known limitations".
 8. **Cold starts.** The container image takes ~1.9 s to initialise. That's
    irrelevant for an async pipeline and rare at steady state; provisioned
    concurrency isn't worth paying for here.
