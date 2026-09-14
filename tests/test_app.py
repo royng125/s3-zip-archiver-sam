@@ -223,3 +223,58 @@ def test_event_without_sequencer_does_not_replace_a_different_zip(s3, app):
 
     assert out["results"][0]["status"] == "stale"
     assert keys(s3) == ["g.json", "g.json.zip"]
+
+
+# --- same key written several times while events are in flight -------------
+
+SEQ1, SEQ2, SEQ3 = "0062E99A88DC407460", "0062E99A88DC407471", "0062E99A88DC407482"
+
+
+def event_with_etag(key, sequencer=None, etag=None):
+    event = event_for(key, sequencer)
+    if etag is not None:
+        event["Records"][0]["s3"]["object"]["eTag"] = etag.strip('"')
+    return event
+
+
+def put(s3, key, body):
+    return s3.put_object(Bucket=BUCKET, Key=key, Body=body)["ETag"]
+
+
+def bucket_state(s3):
+    return {
+        k: zip_content(s3, k) if k.endswith(".zip") else s3.get_object(Bucket=BUCKET, Key=k)["Body"].read()
+        for k in keys(s3)
+    }
+
+
+def run_once_before(s3, monkeypatch, method, when, action):
+    """Run action the first time s3.<method> is called with matching kwargs."""
+    real = getattr(s3, method)
+    fired = {"done": False}
+
+    def wrapper(**kwargs):
+        if not fired["done"] and when(kwargs):
+            fired["done"] = True
+            action()
+        return real(**kwargs)
+
+    monkeypatch.setattr(s3, method, wrapper)
+
+
+def test_late_event_does_not_label_newer_content_with_its_sequencer(s3, app, monkeypatch):
+    # v1 and v2 uploaded; E2 has read v2 and is slow. v3 is uploaded, then the
+    # late E1 arrives. E1 used to read v3, archive it under seq1 and delete it,
+    # so E2 later "won" against seq1 and put v2 back: v3 was lost.
+    e1 = put(s3, "k.json", b"v1")
+    e2 = put(s3, "k.json", b"v2")
+
+    def meanwhile():
+        e3 = put(s3, "k.json", b"v3")
+        assert app.handler(event_with_etag("k.json", SEQ1, e1), None)["results"][0]["status"] == "superseded"
+        app.handler(event_with_etag("k.json", SEQ3, e3), None)
+
+    run_once_before(s3, monkeypatch, "head_object", lambda kw: kw["Key"] == "k.json.zip", meanwhile)
+    app.handler(event_with_etag("k.json", SEQ2, e2), None)
+
+    assert bucket_state(s3) == {"k.json.zip": b"v3"}

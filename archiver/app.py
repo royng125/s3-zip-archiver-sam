@@ -25,11 +25,13 @@ def handler(event, context):
         key = unquote_plus(record["s3"]["object"]["key"])
         # S3 orders events for the same key by this hex value
         sequencer = record["s3"]["object"].get("sequencer")
-        results.append(archive_object(bucket, key, sequencer))
+        # ETag of the version this event is about
+        event_etag = record["s3"]["object"].get("eTag")
+        results.append(archive_object(bucket, key, sequencer, event_etag))
     return {"results": results}
 
 
-def archive_object(bucket, key, sequencer=None):
+def archive_object(bucket, key, sequencer=None, event_etag=None):
     if key.endswith(ZIP_SUFFIX):
         # Every new object triggers us, including the zips we write back.
         # This check is what stops the loop, so it has to stay first.
@@ -37,9 +39,16 @@ def archive_object(bucket, key, sequencer=None):
         logger.debug("skipping %s, already a zip", key)
         return {"key": key, "status": "skipped"}
 
+    # Read exactly the version the event describes. If the key was overwritten
+    # after the event, the current object has its own event; archiving it here
+    # would label newer content with this event's older sequencer.
+    condition = {"IfMatch": '"%s"' % event_etag.strip('"')} if event_etag else {}
     try:
-        obj = s3.get_object(Bucket=bucket, Key=key)
+        obj = s3.get_object(Bucket=bucket, Key=key, **condition)
     except ClientError as err:
+        if err.response["ResponseMetadata"]["HTTPStatusCode"] == 412:
+            logger.info("%s was overwritten after this event, skipping", key)
+            return {"key": key, "status": "superseded"}
         if err.response["Error"]["Code"] == "NoSuchKey":
             # S3 notifications are at-least-once. A redelivered event can show up
             # after the first invocation already deleted the original.
