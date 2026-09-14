@@ -59,6 +59,7 @@ def main():
     p.add_argument("--log-bytes", type=int, default=500, help="log bytes per archive run")
     p.add_argument("--skip-duration-ms", type=float, default=3, help="billed duration when the event is our own zip")
     p.add_argument("--skip-log-bytes", type=int, default=350, help="log bytes per skipped run")
+    p.add_argument("--retention-months", type=int, default=12, help="months of archives kept once capped")
     a = p.parse_args()
 
     n = a.files_per_hour * HOURS_PER_MONTH
@@ -113,6 +114,10 @@ def main():
     print()
     print(f"Final monthly figure: {money(bill(1, True))} in month 1, then about +{money(growth_with)} per month"
           f" while archives are kept")
+    # once a lifecycle rule caps retention the bucket always holds exactly that many months
+    r = a.retention_months
+    print(f"Steady state with {r} months retained: {money(producer_puts + processing + tiered(month_zip_gb * r, S3_STANDARD_TIERS))}"
+          f" with / {money(producer_puts + tiered(month_orig_gb * r, S3_STANDARD_TIERS))} without the feature")
     print()
 
     print("Alternatives / suggestions")

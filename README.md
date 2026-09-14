@@ -414,9 +414,9 @@ feature adds; the rest is the producer's uploads and the zip storage. Without
 the feature the first month costs US$86,196 and grows by US$163,965 a month.
 
 The bill has no single steady-state value while storage keeps growing. With a
-retention or lifecycle rule that caps what is kept, it levels off: keeping
-twelve months in S3 Standard, just above the month-12 row, about **US$311K a
-month with the feature against US$1.89M without**.
+retention or lifecycle rule that caps what is kept, it levels off: with twelve
+months kept in S3 Standard, about **US$323,672 a month with the feature against
+US$1,971,791 without**.
 
 ### Ways to save more
 
