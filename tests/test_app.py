@@ -278,3 +278,56 @@ def test_late_event_does_not_label_newer_content_with_its_sequencer(s3, app, mon
     app.handler(event_with_etag("k.json", SEQ2, e2), None)
 
     assert bucket_state(s3) == {"k.json.zip": b"v3"}
+
+
+def test_identical_reupload_is_not_replaced_by_an_older_version(s3, app, monkeypatch):
+    # zip(AAA) exists. BBB is uploaded and its invocation is slow. AAA is
+    # uploaded again; its event finds a zip with the same source ETag, deletes
+    # the original and leaves the zip labelled with the old sequencer. The slow
+    # BBB invocation must not treat that zip as older and overwrite it.
+    ea = put(s3, "m.json", b"AAA")
+    app.handler(event_with_etag("m.json", SEQ1, ea), None)
+    eb = put(s3, "m.json", b"BBB")
+
+    def meanwhile():
+        ea_again = put(s3, "m.json", b"AAA")
+        app.handler(event_with_etag("m.json", SEQ3, ea_again), None)
+
+    run_once_before(s3, monkeypatch, "head_object", lambda kw: kw["Key"] == "m.json.zip", meanwhile)
+    out = app.handler(event_with_etag("m.json", SEQ2, eb), None)
+
+    assert out["results"][0]["status"] == "stale"
+    assert bucket_state(s3) == {"m.json.zip": b"AAA"}
+
+
+def test_backfill_zip_is_not_replaced_by_a_slow_older_event(s3, app, monkeypatch):
+    # A zip written without a sequencer (backfill, manual invoke) holds newer
+    # content than a slow live event that read the previous version.
+    e1 = put(s3, "n.json", b"old")
+
+    def meanwhile():
+        put(s3, "n.json", b"new")
+        app.archive_object(BUCKET, "n.json")
+
+    run_once_before(s3, monkeypatch, "head_object", lambda kw: kw["Key"] == "n.json.zip", meanwhile)
+    out = app.handler(event_with_etag("n.json", SEQ1, e1), None)
+
+    assert out["results"][0]["status"] == "stale"
+    assert bucket_state(s3) == {"n.json.zip": b"new"}
+
+
+def test_zip_without_our_metadata_is_not_replaced_by_a_slow_older_event(s3, app, monkeypatch):
+    e1 = put(s3, "p.json", b"old")
+
+    def meanwhile():
+        put(s3, "p.json", b"new")
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("p.json", b"new")
+        s3.put_object(Bucket=BUCKET, Key="p.json.zip", Body=buf.getvalue())
+        s3.delete_object(Bucket=BUCKET, Key="p.json")
+
+    run_once_before(s3, monkeypatch, "head_object", lambda kw: kw["Key"] == "p.json.zip", meanwhile)
+    app.handler(event_with_etag("p.json", SEQ1, e1), None)
+
+    assert bucket_state(s3) == {"p.json.zip": b"new"}

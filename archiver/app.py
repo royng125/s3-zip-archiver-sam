@@ -66,7 +66,7 @@ def archive_object(bucket, key, sequencer=None, event_etag=None):
                 for chunk in obj["Body"].iter_chunks(CHUNK_SIZE):
                     entry.write(chunk)
         zip_size = buf.tell()
-        outcome = write_zip(bucket, zip_key, buf, etag, sequencer)
+        outcome = write_zip(bucket, key, zip_key, buf, etag, sequencer)
 
     if outcome == "stale":
         # A zip made from a newer upload of this key is already in place, so
@@ -105,7 +105,7 @@ def archive_object(bucket, key, sequencer=None, event_etag=None):
     }
 
 
-def write_zip(bucket, zip_key, body, source_etag, sequencer):
+def write_zip(bucket, source_key, zip_key, body, source_etag, sequencer):
     """Upload the zip without ever replacing one made from a newer upload.
 
     Without this, a slow invocation for an old version could finish after the
@@ -136,6 +136,16 @@ def write_zip(bucket, zip_key, body, source_etag, sequencer):
                 return "already-there"
             if not is_newer(sequencer, theirs.get("source-sequencer")):
                 return "stale"
+            # A zip's sequencer can be lower than its content (a backfill zip has
+            # none; an identical re-upload keeps the old one). So only replace a
+            # zip while our source is still the live object; if it's gone or
+            # changed, a newer write has already been archived.
+            try:
+                s3.head_object(Bucket=bucket, Key=source_key, IfMatch='"%s"' % source_etag)
+            except ClientError as err:
+                if err.response["ResponseMetadata"]["HTTPStatusCode"] in (404, 412):
+                    return "stale"
+                raise
             condition = {"IfMatch": existing["ETag"]}
 
         body.seek(0)
