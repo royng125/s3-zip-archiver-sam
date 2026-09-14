@@ -14,6 +14,7 @@ s3 = boto3.client("s3")
 
 ZIP_SUFFIX = ".zip"
 CHUNK_SIZE = 8 * 1024 * 1024
+PUT_ATTEMPTS = 3
 
 
 def handler(event, context):
@@ -22,11 +23,13 @@ def handler(event, context):
         bucket = record["s3"]["bucket"]["name"]
         # keys arrive url-encoded in the event ("my file.json" -> "my+file.json")
         key = unquote_plus(record["s3"]["object"]["key"])
-        results.append(archive_object(bucket, key))
+        # S3 orders events for the same key by this hex value
+        sequencer = record["s3"]["object"].get("sequencer")
+        results.append(archive_object(bucket, key, sequencer))
     return {"results": results}
 
 
-def archive_object(bucket, key):
+def archive_object(bucket, key, sequencer=None):
     if key.endswith(ZIP_SUFFIX):
         # Every new object triggers us, including the zips we write back.
         # This check is what stops the loop, so it has to stay first.
@@ -54,22 +57,13 @@ def archive_object(bucket, key):
                 for chunk in obj["Body"].iter_chunks(CHUNK_SIZE):
                     entry.write(chunk)
         zip_size = buf.tell()
-        buf.seek(0)
-        s3.upload_fileobj(
-            buf,
-            bucket,
-            zip_key,
-            ExtraArgs={
-                "ContentType": "application/zip",
-                "Metadata": {"source-etag": etag.strip('"')},
-            },
-        )
+        outcome = write_zip(bucket, zip_key, buf, etag, sequencer)
 
-    uploaded = s3.head_object(Bucket=bucket, Key=zip_key)
-    if uploaded["ContentLength"] != zip_size:
-        raise RuntimeError(
-            f"size mismatch for {zip_key}: wrote {zip_size}, S3 has {uploaded['ContentLength']}"
-        )
+    if outcome == "stale":
+        # A zip made from a newer upload of this key is already in place, so
+        # this version was overwritten and is not ours to delete.
+        logger.warning("%s: newer version already archived, leaving this one", key)
+        return {"key": key, "zip_key": zip_key, "status": "stale"}
 
     # Conditional delete: S3 removes the object only if it is still the version
     # we compressed. The previous HEAD-then-DELETE left a gap where a new upload
@@ -100,3 +94,69 @@ def archive_object(bucket, key):
         "original_bytes": obj["ContentLength"],
         "zip_bytes": zip_size,
     }
+
+
+def write_zip(bucket, zip_key, body, source_etag, sequencer):
+    """Upload the zip without ever replacing one made from a newer upload.
+
+    Without this, a slow invocation for an old version could finish after the
+    invocation for the new version and put the old content back on top.
+
+    Returns "written", "already-there" when the zip for this exact source
+    version exists (e.g. a retry after failing between upload and delete),
+    or "stale" when the existing zip comes from a newer upload.
+    """
+    source_etag = source_etag.strip('"')
+    metadata = {"source-etag": source_etag}
+    if sequencer:
+        metadata["source-sequencer"] = sequencer
+
+    for _ in range(PUT_ATTEMPTS):
+        try:
+            existing = s3.head_object(Bucket=bucket, Key=zip_key)
+        except ClientError as err:
+            if err.response["ResponseMetadata"]["HTTPStatusCode"] != 404:
+                raise
+            existing = None
+
+        if existing is None:
+            condition = {"IfNoneMatch": "*"}
+        else:
+            theirs = existing.get("Metadata", {})
+            if theirs.get("source-etag") == source_etag:
+                return "already-there"
+            if not is_newer(sequencer, theirs.get("source-sequencer")):
+                return "stale"
+            condition = {"IfMatch": existing["ETag"]}
+
+        body.seek(0)
+        try:
+            # Single PUT, fine up to 5 GB of zip. S3 rejects the upload if the
+            # bytes it received don't match the SHA-256 the SDK sends along.
+            s3.put_object(
+                Bucket=bucket,
+                Key=zip_key,
+                Body=body,
+                ContentType="application/zip",
+                ChecksumAlgorithm="SHA256",
+                Metadata=metadata,
+                **condition,
+            )
+            return "written"
+        except ClientError as err:
+            if err.response["ResponseMetadata"]["HTTPStatusCode"] not in (409, 412):
+                raise
+            # someone else wrote the zip between our HEAD and PUT, look again
+
+    raise RuntimeError(f"{zip_key} kept changing while writing it")
+
+
+def is_newer(ours, theirs):
+    # Sequencers of events for the same key compare as hex numbers. Without one
+    # of our own (manual invoke, batch job) we can't claim to be newer; a zip
+    # without one was written before sequencers were recorded.
+    if not ours:
+        return False
+    if not theirs:
+        return True
+    return int(ours, 16) > int(theirs, 16)
