@@ -142,6 +142,24 @@ Resources:
       # Versioning is intentionally off. With versioning on, deleting the
       # original only adds a delete marker and the bytes stay billed.
 
+  ArchiveBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArchiveBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyPlainHttp
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !Sub "arn:${AWS::Partition}:s3:::${ArchiveBucket}"
+              - !Sub "arn:${AWS::Partition}:s3:::${ArchiveBucket}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
   # Events that still fail after Lambda's async retries end up here instead
   # of being dropped.
   FailedEventsQueue:
