@@ -28,9 +28,10 @@ def handler(event, context):
 
 def archive_object(bucket, key):
     if key.endswith(ZIP_SUFFIX):
-        # The bucket notification only fires for the configured suffix, but if
-        # someone widens that filter we'd end up zipping our own output forever.
-        logger.warning("skipping %s, already a zip", key)
+        # Every new object triggers us, including the zips we write back.
+        # This check is what stops the loop, so it has to stay first.
+        # debug level: at full volume this path runs once per archived object.
+        logger.debug("skipping %s, already a zip", key)
         return {"key": key, "status": "skipped"}
 
     try:

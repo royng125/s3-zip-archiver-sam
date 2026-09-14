@@ -72,6 +72,16 @@ def test_key_with_spaces(s3, app):
     assert keys(s3) == ["results/run 7/out file.json.zip"]
 
 
+@pytest.mark.parametrize("key", ["exports/run-42.ndjson", "exports/no-extension", "exports/REPORT.JSON"])
+def test_any_new_object_is_archived(s3, app, key):
+    s3.put_object(Bucket=BUCKET, Key=key, Body=b'{"a": 1}\n{"a": 2}\n')
+
+    out = app.handler(event_for(key), None)
+
+    assert out["results"][0]["status"] == "archived"
+    assert keys(s3) == [key + ".zip"]
+
+
 def test_zip_objects_are_ignored(s3, app):
     s3.put_object(Bucket=BUCKET, Key="results/old.json.zip", Body=b"PK")
 

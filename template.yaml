@@ -3,12 +3,6 @@ Transform: AWS::Serverless-2016-10-31
 Description: Compress new objects in an S3 bucket to ZIP with a container-image Lambda
 
 Parameters:
-  SourceSuffix:
-    Type: String
-    Default: .json
-    Description: >-
-      Only objects whose key ends with this suffix trigger the function.
-      Can't be .zip, otherwise the function would re-trigger on its own output.
   ReleaseId:
     Type: String
     Default: manual
@@ -27,12 +21,6 @@ Parameters:
   PrivateSubnetBCidr:
     Type: String
     Default: 10.20.16.0/20
-
-Rules:
-  SuffixMustNotBeZip:
-    Assertions:
-      - Assert: !Not [!Equals [!Ref SourceSuffix, ".zip"]]
-        AssertDescription: SourceSuffix can't be .zip
 
 Resources:
   # --- network -------------------------------------------------------------
@@ -213,16 +201,15 @@ Resources:
               Action: s3:ListBucket
               Resource: !Sub "arn:${AWS::Partition}:s3:::${AWS::StackName}-${AWS::AccountId}-${AWS::Region}"
       Events:
+        # Every new object triggers the function, as the task asks. The zips it
+        # writes back trigger it too; the handler returns immediately for those,
+        # and Lambda's recursive loop detection for S3 is a platform backstop.
+        # This costs one short invocation per zip, which the README prices.
         NewObject:
           Type: S3
           Properties:
             Bucket: !Ref ArchiveBucket
             Events: s3:ObjectCreated:*
-            Filter:
-              S3Key:
-                Rules:
-                  - Name: suffix
-                    Value: !Ref SourceSuffix
     Metadata:
       DockerContext: ./archiver
       Dockerfile: Dockerfile
