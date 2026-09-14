@@ -169,12 +169,14 @@ aws s3 ls s3://$BUCKET/results/
 # results/sample.json.zip
 ```
 
-### Deployment check (free tier, personal account)
+### Deployment checks (free tier, personal account)
 
-Deployed to `ap-southeast-1` on 2026-09-14 from commit `14d9ff4`. Stack
-creation took about 5 minutes. Account id replaced with `<account>`.
+Both deployments below went to `ap-southeast-1` in a personal account.
+Account id replaced with `<account>`. `make smoke` repeats the checks.
 
-What was checked after the deploy:
+#### First deployment, commit `14d9ff4`
+
+Stack creation took about 5 minutes. What was checked after the deploy:
 
 ```
 bucket notification   arn:aws:lambda:ap-southeast-1:<account>:function:s3-zip-archiver-ArchiverFunction-…:live
@@ -210,9 +212,56 @@ From the function's `REPORT` lines:
 | cold start (init 1900 ms) | 803 ms | 2704 ms | 105 MB |
 | warm, 10.4 MB file (4 runs) | 698–733 ms, avg 715 ms | same | 111 MB |
 
-Compression ratio on this data was 6.44x (10,952,097 -> 1,700,604 bytes) and
-each invocation wrote about 507 bytes of logs. These are the numbers used in
-the cost section.
+#### After the hardening changes, commit `b978ca7` (version 4)
+
+Stack update took about a minute and a half including the image build.
+
+```
+bucket notification   arn:aws:lambda:ap-southeast-1:<account>:function:s3-zip-archiver-ArchiverFunction-…:live
+                      s3:ObjectCreated:*  no key filter
+versions              1 14d9ff4 / 2 3470e19 / 3 23048e7 / 4 b978ca7, alias live -> 4
+alarms                Errors, Throttles, AsyncEventAge, failed-events queue: all OK
+bucket policy         DenyPlainHttp (aws:SecureTransport = false)
+VPC routes            10.20.0.0/16 local, pl-6fa54006 (S3); internet gateways 0; NAT gateways 0
+account concurrency   limit 10 (see Scalability)
+```
+
+The handler relies on how S3 answers conditional requests, and the unit tests
+use moto for that. The same requests against the real bucket, on `.zip` keys so
+the function ignores them:
+
+```
+PUT    If-None-Match: *   on an existing key   -> 412 PreconditionFailed
+PUT    If-Match: <wrong etag>                   -> 412 PreconditionFailed
+DELETE If-Match: <wrong etag>                   -> 412 PreconditionFailed
+DELETE If-Match: <right etag>                   -> 204
+DELETE If-Match: <etag>  on a missing key       -> 404 NoSuchKey
+```
+
+Same answers as moto.
+
+`make smoke` uploaded a JSON file, an NDJSON file, a key without an extension
+and a producer `.zip`:
+
+```
+smoke/…/lines.ndjson.zip
+smoke/…/no extension.zip
+smoke/…/producer.zip          <- left alone
+smoke/…/result.json.zip       unzipped entry has the same sha256 as the upload
+failed-events queue           0
+```
+
+Then twenty 10.4 MB uploads, one at a time because of the concurrency limit,
+with the `REPORT` lines grouped by whether the invocation archived something:
+
+| invocation | runs | billed duration | max memory | log bytes |
+|---|---|---|---|---|
+| archive, 10.4 MB JSON | 20 | avg 743 ms (median 699, min 676, max 1,539) | 114 MB | 464 |
+| triggered by its own zip | 20 | avg 2 ms | 114 MB | 258 |
+
+Each zip carries `source-etag` and `source-sequencer` metadata and a
+`ChecksumSHA256` verified by S3. The compression ratio was 6.44x again
+(10,952,097 -> 1,700,596 bytes). These are the inputs of the cost section.
 
 ### Rolling back
 
