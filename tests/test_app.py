@@ -101,6 +101,54 @@ def test_redelivered_event_is_a_noop(s3, app):
     assert keys(s3) == ["a.json.zip"]
 
 
+def zip_content(s3, zip_key):
+    data = s3.get_object(Bucket=BUCKET, Key=zip_key)["Body"].read()
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        return zf.read(zf.namelist()[0])
+
+
+def test_overwrite_right_before_delete_is_not_lost(s3, app, monkeypatch):
+    # Used to be a real data loss: the ETag check passed, the producer uploaded
+    # a new version, and the unconditional delete removed it.
+    s3.put_object(Bucket=BUCKET, Key="d.json", Body=b'{"v": 1}')
+    real_delete = s3.delete_object
+
+    def overwrite_then_delete(**kwargs):
+        s3.put_object(Bucket=BUCKET, Key="d.json", Body=b'{"v": 2}')
+        return real_delete(**kwargs)
+
+    monkeypatch.setattr(s3, "delete_object", overwrite_then_delete)
+    out = app.handler(event_for("d.json"), None)
+    monkeypatch.setattr(s3, "delete_object", real_delete)
+
+    assert out["results"][0]["status"] == "kept-original"
+    assert s3.get_object(Bucket=BUCKET, Key="d.json")["Body"].read() == b'{"v": 2}'
+
+    # the new version's own event then archives it
+    app.handler(event_for("d.json"), None)
+    assert keys(s3) == ["d.json.zip"]
+    assert zip_content(s3, "d.json.zip") == b'{"v": 2}'
+
+
+def test_duplicate_invocation_deleting_first_is_not_an_error(s3, app, monkeypatch):
+    # Two deliveries of the same event running at once: the other one deletes
+    # the original first. Previously this surfaced as a 404 from HEAD and a
+    # failed invocation that Lambda retried.
+    s3.put_object(Bucket=BUCKET, Key="c.json", Body=b'{"c": 1}')
+    real_delete = s3.delete_object
+
+    def other_invocation_deletes_first(**kwargs):
+        real_delete(Bucket=BUCKET, Key="c.json")
+        return real_delete(**kwargs)
+
+    monkeypatch.setattr(s3, "delete_object", other_invocation_deletes_first)
+
+    out = app.handler(event_for("c.json"), None)
+
+    assert out["results"][0]["status"] == "missing"
+    assert keys(s3) == ["c.json.zip"]
+
+
 def test_original_overwritten_mid_flight_is_not_deleted(s3, app, monkeypatch):
     s3.put_object(Bucket=BUCKET, Key="b.json", Body=b'{"v": 1}')
     real_upload = s3.upload_fileobj

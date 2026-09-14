@@ -71,14 +71,23 @@ def archive_object(bucket, key):
             f"size mismatch for {zip_key}: wrote {zip_size}, S3 has {uploaded['ContentLength']}"
         )
 
-    # Only delete the version we actually compressed. If the producer overwrote
-    # the key in the meantime, that new upload has its own event on the way.
-    current = s3.head_object(Bucket=bucket, Key=key)
-    if current["ETag"] != etag:
-        logger.warning("%s changed while archiving, leaving it in place", key)
-        return {"key": key, "zip_key": zip_key, "status": "kept-original"}
-
-    s3.delete_object(Bucket=bucket, Key=key)
+    # Conditional delete: S3 removes the object only if it is still the version
+    # we compressed. The previous HEAD-then-DELETE left a gap where a new upload
+    # landing in between was deleted without ever being zipped.
+    try:
+        s3.delete_object(Bucket=bucket, Key=key, IfMatch=etag)
+    except ClientError as err:
+        status = err.response["ResponseMetadata"]["HTTPStatusCode"]
+        if status in (409, 412):
+            # 412: replaced since we read it. 409: a concurrent write won.
+            # Either way the newer object has its own event coming.
+            logger.warning("%s changed while archiving, leaving it in place", key)
+            return {"key": key, "zip_key": zip_key, "status": "kept-original"}
+        if status == 404:
+            # a duplicate delivery of the same event got there first
+            logger.info("%s already removed by another invocation", key)
+            return {"key": key, "zip_key": zip_key, "status": "missing"}
+        raise
 
     logger.info(
         "archived s3://%s/%s -> %s (%d -> %d bytes)",
