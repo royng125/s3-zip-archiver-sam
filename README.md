@@ -255,6 +255,16 @@ Each zip carries `source-etag` and `source-sequencer` metadata and a
 `ChecksumSHA256` verified by S3. The compression ratio was 6.44x again
 (10,952,097 -> 1,700,596 bytes). These are the inputs of the cost section.
 
+#### Version 5, commit `d9cbe87`
+
+The concurrency fixes (reading the event's exact version, checking the source
+is still live before replacing a zip, leaving a foreign `<key>.zip` alone)
+deployed on top: `live -> 5`, versions 1-4 kept, `make smoke` passed again. On
+the real bucket, GET and HEAD with a wrong `If-Match` return 412 and HEAD on a
+missing key returns 404, as in moto. Uploading a producer's `report.zip` and
+then `report` left both untouched, with the version `[5]` log stream reporting
+that the zip "wasn't written by the archiver".
+
 ### Rolling back
 
 ```bash
