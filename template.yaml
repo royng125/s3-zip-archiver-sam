@@ -5,10 +5,12 @@ Description: Compress new objects in an S3 bucket to ZIP with a container-image 
 Parameters:
   ReleaseId:
     Type: String
-    Default: manual
+    AllowedPattern: ".+"
     Description: >-
-      Identifier of the release being deployed (the Makefile passes the git
-      commit). Changing it is what forces a new Lambda version on every deploy.
+      Identifier of the release being deployed; `make deploy` passes the git
+      commit. Used as AutoPublishCodeSha256, so each release publishes a new
+      Lambda version. No default on purpose: deploying without it would leave
+      the version unchanged.
   LogRetentionDays:
     Type: Number
     Default: 14
