@@ -344,60 +344,79 @@ repository and artifact bucket SAM created for the stack.
 ### Assumptions
 
 - 1,000,000 files per hour x 730 hours = **730 million files a month**,
-  10 MB each, one invocation per file.
-- Duration and log volume are the measured values from the deployment above:
-  715 ms average at 1024 MB, ~507 bytes of logs per invocation.
+  10 MB each.
+- Every archived file means two invocations: the archive run, and a short one
+  when its own zip triggers the function.
+- Durations and log sizes are the measured values from the second deployment:
+  743 ms and 464 bytes per archive run, 2 ms and 258 bytes per zip-triggered
+  run, at 1024 MB. That's twenty runs on synthetic data, one at a time; real
+  files under real concurrency could be slower.
 - Compression ratio 6.44x, measured on synthetic JSON. Real video-analysis
   output could compress better or worse, and the storage numbers scale directly
   with this ratio.
+- Files arrive evenly through the month and are kept, so month N pays for
+  N - 0.5 months of data on average. An earlier version of this section charged
+  a full month of storage in the first month and overstated the first-month
+  saving by roughly 2x.
 - On-demand prices for `ap-southeast-1` from the AWS Price List API, free tier
-  ignored. The producer's own uploads (and their PUT requests) already exist
-  today, so they're not counted as part of this feature.
+  ignored.
 
 `scripts/cost_estimate.py` reproduces every number below:
 
 ```bash
-python scripts/cost_estimate.py --duration-ms 715 --ratio 6.44 --log-bytes 507
+python scripts/cost_estimate.py --duration-ms 743 --ratio 6.44 --log-bytes 464 \
+  --skip-duration-ms 2 --skip-log-bytes 258
 ```
 
 ### What the feature costs to run
 
+The same every month:
+
 | item | volume per month | USD / month |
 |---|---|---|
-| Lambda requests | 730M x $0.20 per 1M | 146 |
-| Lambda compute, x86_64 | 521.95M GB-s x $0.0000166667 | 8,699 |
+| Lambda requests | 1,460M (archive + zip-triggered) x $0.20 per 1M | 292 |
+| Lambda compute, archive runs, x86_64 | 542.4M GB-s x $0.0000166667 | 9,040 |
+| Lambda compute, zip-triggered runs | 1.46M GB-s | 24 |
 | S3 GET, read original | 730M x $0.0004 per 1K | 292 |
+| S3 HEAD, check for an existing zip | 730M x $0.0004 per 1K | 292 |
 | S3 PUT, write zip | 730M x $0.005 per 1K | 3,650 |
-| S3 HEAD x2, verify zip + check original | 1,460M x $0.0004 per 1K | 584 |
 | S3 DELETE | free | 0 |
-| CloudWatch Logs ingestion | ~345 GB x $0.70 | 241 |
+| CloudWatch Logs ingestion | ~491 GB x $0.70 | 344 |
+| CloudWatch alarms | 4 x $0.10 | < 1 |
 | S3 gateway endpoint, in-region transfer | free | 0 |
-| ECR image (207 MB) and SQS (failures only) | | < 1 |
-| **total** | | **~13,600** |
+| ECR image (207 MB), SQS and SNS (failures only) | | < 1 |
+| **total** | | **~13,934** |
 
-Cold starts add a little on top: the image's 1.9 s init is billed, but at
-~200 warm environments running continuously they are a very small share of
-invocations.
+That is about $0.000019 per file, or $19 per million files. Cold starts add a
+little on top: the image's 1.9 s init is billed, but at ~200 warm environments
+running continuously they are a very small share of invocations.
 
-### What it saves
+### Monthly bill with and without the feature
 
-One month of output is 6.80 PiB of raw JSON or 1.06 PiB zipped. Kept in
-S3 Standard, that month of data costs:
+Both columns include the producer's 730M uploads ($3,650). "Without" keeps the
+raw JSON in S3 Standard; "with" adds the processing above and keeps only the
+zips.
 
-| | size | USD per month it is stored |
+| month | without feature | with feature |
 |---|---|---|
-| raw JSON (today) | 6.80 PiB | 164,528 |
-| zipped | 1.06 PiB | 26,024 |
-| **difference** | | **138,504** |
+| 1 | 86,196 | **30,878** |
+| 2 | 250,160 | 56,338 |
+| 3 | 414,125 | 81,798 |
+| 6 | 906,020 | 158,179 |
+| 12 | 1,889,809 | 310,942 |
+| each further month | +163,965 | +25,460 |
 
-### Monthly figure
+### Final monthly figure
 
-- **The feature itself costs about US$13,600 per month.**
-- In the first month it removes about US$138,500 of storage, so the bill is
-  roughly **US$124,900 lower** than without it.
-- The gap widens every month because stored data accumulates while the
-  processing cost stays flat. After a year of retention, storage would be
-  around US$312K/month zipped against about US$1.97M/month raw.
+**US$30,878 for the first month, then about US$25,460 more each month for as
+long as the archives are kept.** US$13,934 of that is the processing this
+feature adds; the rest is the producer's uploads and the zip storage. Without
+the feature the first month costs US$86,196 and grows by US$163,965 a month.
+
+The bill has no single steady-state value while storage keeps growing. With a
+retention or lifecycle rule that caps what is kept, it levels off: keeping
+twelve months in S3 Standard, just above the month-12 row, about **US$311K a
+month with the feature against US$1.89M without**.
 
 ### Ways to save more
 
@@ -407,27 +426,30 @@ Roughly in order of impact:
    NAT gateway would add about **US$486,000 per month** in data processing,
    more than everything else combined.
 2. **Compress before uploading.** If the on-prem exporter writes ZIP (or
-   gzip/zstd) itself, the whole ~US$13.6K of processing disappears and upload
+   gzip/zstd) itself, the ~US$13.9K of processing disappears and upload
    bandwidth drops about 6x. This Lambda is the right tool when the producer
    can't be changed.
-3. **Move old archives to a colder class.** Zipped data in Glacier Instant
-   Retrieval costs ~US$5,500 per month of data instead of ~US$26,000 in
+3. **Move older archives to a colder class.** One month of zips costs
+   ~US$5,500 a month in Glacier Instant Retrieval instead of ~US$26,000 in
    Standard. Deep Archive is ~US$2,200, but lifecycle transitions are charged
-   per object (US$43,800 for 730M objects), there's a 180-day minimum and
-   retrieval takes hours, so it only pays off for data that is almost never
-   read.
-4. **Fewer, bigger objects.** PUT, HEAD and especially lifecycle transition
-   costs are per object. Bundling files into one archive per minute or per
-   video (S3 -> SQS -> batch consumer) divides those line items by the
-   bundle size.
-5. **arm64.** Graviton compute is 20% cheaper here, about US$1,740/month
-   saved. Needs the image built for arm64.
-6. **Right-size memory.** Max memory used was 111 MB out of 1024 MB. Lowering
+   per object (US$43,800 for a month's 730M objects), there's a 180-day minimum
+   and retrieval takes hours, so it only pays off for data that is almost
+   never read.
+4. **Fewer, bigger objects.** Lambda requests (US$292), PUTs (US$3,650),
+   GET/HEAD (US$584) and especially lifecycle transitions are charged per
+   object. Bundling files into one archive per minute or per video
+   (S3 -> SQS -> batch consumer) divides those line items by the bundle size.
+5. **arm64.** Graviton compute is 20% cheaper, about US$1,813 a month. Needs
+   the image built for arm64, which the CI job could do with a multi-arch
+   build.
+6. **Right-size memory.** Max memory used was 114 MB out of 1024 MB. Lowering
    memory also lowers CPU, so duration will go up; the cheapest setting has to
    be measured (e.g. with AWS Lambda Power Tuning). Not measured here.
-7. **Smaller wins.** Log successful archives at DEBUG in production, buy a
-   Compute Savings Plan for the Lambda spend, and drop the verification HEAD
-   calls (US$584) if the PUT response is considered enough.
+7. **Filter the trigger if every object isn't really needed.** Restricting the
+   notification to known source keys removes the zip-triggered runs, about
+   US$293 a month.
+8. **Smaller wins.** Log successful archives at DEBUG in production and buy a
+   Compute Savings Plan for the Lambda spend.
 
 ## Scalability and bottlenecks
 
