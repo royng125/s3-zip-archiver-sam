@@ -344,3 +344,24 @@ def test_producer_zip_with_the_same_name_is_not_overwritten(s3, app):
     assert out["results"][0]["status"] == "zip-key-taken"
     assert s3.get_object(Bucket=BUCKET, Key="report.zip")["Body"].read() == b"PRODUCER-ZIP-BYTES"
     assert keys(s3) == ["report", "report.zip"]
+
+
+def test_zip_deleted_before_the_conditional_put_is_not_an_error(s3, app, monkeypatch):
+    # The zip being replaced disappears between the HEAD and the If-Match PUT
+    # (a lifecycle rule, a manual cleanup). S3 answers 404, which failed the
+    # invocation and tripped the Errors alarm until Lambda's retry succeeded.
+    s3.put_object(Bucket=BUCKET, Key="r.json.zip", Body=b"PK",
+                  Metadata={"source-etag": "older-version", "source-sequencer": SEQ1})
+    etag = put(s3, "r.json", b'{"r": 2}')
+    real_put = s3.put_object
+
+    def zip_vanishes_first(**kwargs):
+        if kwargs["Key"] == "r.json.zip" and "IfMatch" in kwargs:
+            s3.delete_object(Bucket=BUCKET, Key="r.json.zip")
+        return real_put(**kwargs)
+
+    monkeypatch.setattr(s3, "put_object", zip_vanishes_first)
+    out = app.handler(event_with_etag("r.json", SEQ2, etag), None)
+
+    assert out["results"][0]["status"] == "archived"
+    assert bucket_state(s3) == {"r.json.zip": b'{"r": 2}'}

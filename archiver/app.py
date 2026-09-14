@@ -174,9 +174,11 @@ def write_zip(bucket, source_key, zip_key, body, source_etag, sequencer):
             )
             return "written"
         except ClientError as err:
-            if err.response["ResponseMetadata"]["HTTPStatusCode"] not in (409, 412):
+            # 409/412: someone else wrote the zip between our HEAD and PUT.
+            # 404: the zip we meant to replace was deleted in between (If-Match
+            # on a missing key). Either way, look again.
+            if err.response["ResponseMetadata"]["HTTPStatusCode"] not in (404, 409, 412):
                 raise
-            # someone else wrote the zip between our HEAD and PUT, look again
 
     raise RuntimeError(f"{zip_key} kept changing while writing it")
 
