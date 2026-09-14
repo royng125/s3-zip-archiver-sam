@@ -28,12 +28,11 @@ defined in [`template.yaml`](template.yaml).
 
 1. Any new object lands in the bucket and S3 invokes the `live` alias of the
    function asynchronously. Keys ending in `.zip` return immediately.
-2. The function streams the object into a ZIP in `/tmp`.
-3. It looks at the existing `<key>.zip`, if any. A zip made from this exact
-   source version means the work was already done; a zip made from a newer
-   upload means this event is stale and the function stops. Otherwise it
-   uploads the zip with a conditional PUT and a SHA-256 checksum, recording the
-   source ETag and the event's sequencer in the zip's metadata.
+2. It reads exactly the version the event describes (`If-Match` on the
+   event's eTag) and streams it into a ZIP in `/tmp`.
+3. It checks what is already at `<key>.zip` (see "Concurrency and safe
+   delete"), then uploads the zip with a conditional PUT and a SHA-256
+   checksum, recording the source ETag and the event's sequencer.
 4. It deletes the original with a conditional delete (`If-Match` on the ETag it
    read), so a version uploaded in the meantime is never removed.
 5. If an invocation keeps failing, Lambda retries twice and then sends the
@@ -63,8 +62,8 @@ keys ending in `.zip`, before any S3 call. If that check were ever broken,
 Lambda's recursive loop detection for S3 stops the chain after roughly 16
 invocations, but that's a backstop, not the design. The price is one very short
 extra invocation per archived object, included in the cost section. A
-producer's own `.zip` uploads are skipped the same way, which is fine since
-they're already compressed.
+producer's own `.zip` uploads are skipped the same way. If a producer uploads
+both `report` and `report.zip`, that zip is left alone (see below).
 
 **Private subnets without NAT.** The function only needs S3, so the VPC has no
 internet gateway and no NAT gateway. S3 traffic goes through a gateway
@@ -74,43 +73,51 @@ need a network path: Lambda ships them to CloudWatch outside the VPC. See the
 cost section for why NAT would be a very expensive choice here.
 
 **Concurrency and safe delete.** S3 notifications are delivered at least once
-and in no guaranteed order, and a producer can upload a key again while the
-previous version is still being archived. An earlier version of the handler
-got three interleavings wrong. Each one is now reproduced by a test in
-`tests/test_app.py`:
+and in no guaranteed order, and a producer may upload the same key again while
+an earlier version is still being archived. The interleavings that matter,
+each reproduced by a test in `tests/test_app.py`:
 
 ```
-1. Overwrite between the ETag check and the delete  -> the new version was deleted, never zipped
-   A (v1)    GET v1 ── zip ── PUT zip ── HEAD: etag ok ─────────── DELETE  ✗ deletes v2
-   producer                                          PUT v2 ──┘
-   now       DELETE If-Match: etag(v1)  -> 412, v2 stays, its own event archives it
-
-2. Two deliveries of the same event racing          -> spurious errors and retries
-   A1        ... DELETE ─ 204
-   A2        ... HEAD original ─ 404, unhandled
-   now       DELETE If-Match ─ 404 -> "missing", no error
-
-3. A slow invocation for an older version           -> old content put back over the new zip
-   A (v1)    GET v1 ──────────────── slow ─────────────────── PUT zip(v1)  ✗ overwrites zip(v2)
-   B (v2)           GET v2 ── PUT zip(v2) ── DELETE v2
-   now       A sees a zip made from a newer sequencer: writes nothing, deletes nothing
+situation                                  how it's handled
+─────────────────────────────────────────  ─────────────────────────────────────────────────
+same event delivered twice                 second DELETE If-Match gets 404 -> "missing"
+new upload between our read and delete     DELETE If-Match: etag we read -> 412, new version kept
+slow invocation for an older version       zip already made from a newer event -> write nothing
+late event, key overwritten since          GET If-Match: event eTag -> 412 -> "superseded"
+zip labelled older than its content        replace a zip only while our source is still live
+  (backfill zip, identical re-upload)
 ```
 
-The rules the handler follows:
+The rules, in the order the handler applies them:
 
 | situation | action |
 |---|---|
+| the event's version was overwritten before it was read | skip (`superseded`); the newer version has its own event |
 | original is gone | nothing to do (`missing`) |
-| zip exists, made from this exact source ETag | skip the upload, run the conditional delete; this is how a retry after failing between upload and delete finishes |
-| zip exists, made from a newer event sequencer | stop, keep everything (`stale`) |
-| no zip, or zip from an older event | PUT with `If-None-Match: *` / `If-Match: <zip etag>` so two writers can't both win, then conditional delete |
-| original changed before the delete | leave it (`kept-original`); its own event handles it |
+| `<key>.zip` exists without `source-etag` metadata | not written by the archiver: leave both (`zip-key-taken`) |
+| zip exists, made from this exact source ETag | skip the upload, run the conditional delete (how a retry after failing between upload and delete finishes) |
+| zip is from a newer event, or our source is no longer the live object | stop, keep everything (`stale`) |
+| otherwise | PUT with `If-None-Match: *` / `If-Match: <zip etag>`, then conditional delete |
+| original changed before the delete | leave it (`kept-original`) |
 
-Limits of this: an event without a sequencer (a manual invoke, a batch job)
-never replaces a zip made from a different version; and the zip is a single
-PUT, so one archive can be at most 5 GB. Bucket versioning is deliberately off;
-with it on, "deleting" the original would only add a delete marker and save
-nothing.
+**Known limitations.**
+
+- With each result key written once (for example one key per video), the only
+  concurrency is duplicate delivery, which is fully handled. With repeated
+  writes to one key, a write landing in the milliseconds between the source
+  check and the zip PUT can still be overwritten.
+- Events without a sequencer (manual invoke, batch job) never replace a zip
+  made from another version; the original stays in the bucket.
+- A `<key>.zip` the archiver didn't write is never overwritten, so `<key>`
+  stays uncompressed next to it.
+- Keys over 1,020 bytes: `<key>.zip` passes S3's 1,024-byte key limit, the PUT
+  fails and the event ends in the failed-events queue with the original kept.
+- A DELETE answered with 409 counts as `kept-original`; if the conflicting
+  write then failed, no new event arrives and the original stays.
+- An archive is a single PUT, so at most 5 GB.
+
+Bucket versioning is deliberately off; with it on, "deleting" the original
+would only add a delete marker and save nothing.
 
 **Versions and rollback.** `AutoPublishAlias: live` publishes an immutable
 version and S3 always invokes the alias, never `$LATEST`. The Makefile passes
@@ -389,7 +396,8 @@ The same every month:
 
 That is about $0.000019 per file, or $19 per million files. Cold starts add a
 little on top: the image's 1.9 s init is billed, but at ~200 warm environments
-running continuously they are a very small share of invocations.
+running continuously they are a very small share of invocations. Replacing an
+existing zip costs one more HEAD, which only happens when a key is rewritten.
 
 ### Monthly bill with and without the feature
 
@@ -501,11 +509,10 @@ burst from the producer.
    need more ephemeral storage, a longer timeout and a multipart upload, and
    anything near Lambda's 15-minute limit belongs on Fargate or Batch.
 7. **Concurrent and duplicate events.** Notifications are at-least-once and
-   unordered. The three interleavings that used to lose data or fail are
-   handled and tested (see "Concurrency and safe delete"); a duplicate now
-   costs one extra invocation and a HEAD. The remaining limit: an event without
-   a sequencer never replaces a zip made from another version, so in that case
-   the original stays in the bucket, visible rather than lost.
+   unordered. A duplicate delivery costs one extra invocation and is handled;
+   with each key written once, that is the only concurrency there is. Repeated
+   writes to the same key are handled too, except for the millisecond window
+   under "Known limitations".
 8. **Cold starts.** The container image takes ~1.9 s to initialise. That's
    irrelevant for an async pipeline and rare at steady state; provisioned
    concurrency isn't worth paying for here.
@@ -535,9 +542,9 @@ S3 Inventory manifest ──► drop *.zip and keys that already have <key>.zip 
 3. Run a Batch Operations job that invokes the `live` alias for each key.
    Batch Operations sends its own payload (`tasks[].s3Key`) and expects a result
    per task, so the handler needs a small adapter for that format, which isn't
-   written yet. These invocations carry no sequencer, so by the rules above they
-   never replace a zip made from another version and can run while live
-   traffic continues.
+   written yet. It can run while live traffic continues: a backfill invocation
+   never replaces a zip made from another version, and a live event only
+   replaces a zip while its own source is still the live object.
 4. Split jobs by prefix and run them when the producer is quiet. Batch
    Operations uses the same account concurrency as live traffic: with this
    account's limit of 10, 100 million objects would take about 86 days; at 250
