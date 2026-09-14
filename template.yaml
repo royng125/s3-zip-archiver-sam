@@ -11,6 +11,10 @@ Parameters:
       commit. Used as AutoPublishCodeSha256, so each release publishes a new
       Lambda version. No default on purpose: deploying without it would leave
       the version unchanged.
+  AlarmEmail:
+    Type: String
+    Default: ""
+    Description: Optional address subscribed to the alarm topic (needs confirming from the email).
   LogRetentionDays:
     Type: Number
     Default: 14
@@ -23,6 +27,9 @@ Parameters:
   PrivateSubnetBCidr:
     Type: String
     Default: 10.20.16.0/20
+
+Conditions:
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
 
 Resources:
   # --- network -------------------------------------------------------------
@@ -243,6 +250,94 @@ Resources:
       LogGroupName: !Sub "/aws/lambda/${ArchiverFunction}"
       RetentionInDays: !Ref LogRetentionDays
 
+  # --- alarms --------------------------------------------------------------
+  # The failure modes that are otherwise silent: invocations erroring,
+  # throttling against the concurrency quota, events waiting in Lambda's
+  # internal async queue, and events given up on.
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  FunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Archiver invocations are failing (they will be retried, then sent to the failed-events queue)
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ArchiverFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+
+  FunctionThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Archiver is being throttled by the account concurrency limit
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ArchiverFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+
+  AsyncBacklogAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: S3 events have waited more than 15 minutes in Lambda's async queue; originals are piling up
+      Namespace: AWS/Lambda
+      MetricName: AsyncEventAge
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ArchiverFunction
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 900000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+
+  FailedEventsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Events were given up on and are waiting in the failed-events queue for a replay
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt FailedEventsQueue.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+
 Outputs:
   BucketName:
     Value: !Ref ArchiveBucket
@@ -252,6 +347,8 @@ Outputs:
     Value: !Ref ArchiverFunctionAliaslive
   FailedEventsQueueUrl:
     Value: !Ref FailedEventsQueue
+  AlarmTopicArn:
+    Value: !Ref AlarmTopic
   VpcId:
     Value: !Ref Vpc
   PrivateSubnetIds:
