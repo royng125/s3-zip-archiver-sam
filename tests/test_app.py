@@ -331,3 +331,16 @@ def test_zip_without_our_metadata_is_not_replaced_by_a_slow_older_event(s3, app,
     app.handler(event_with_etag("p.json", SEQ1, e1), None)
 
     assert bucket_state(s3) == {"p.json.zip": b"new"}
+
+
+def test_producer_zip_with_the_same_name_is_not_overwritten(s3, app):
+    # Since every object triggers the function, "report" and a producer's own
+    # "report.zip" collide on the output key.
+    s3.put_object(Bucket=BUCKET, Key="report.zip", Body=b"PRODUCER-ZIP-BYTES")
+    s3.put_object(Bucket=BUCKET, Key="report", Body=b'{"x": 1}')
+
+    out = app.handler(event_for("report", SEQ_OLD), None)
+
+    assert out["results"][0]["status"] == "zip-key-taken"
+    assert s3.get_object(Bucket=BUCKET, Key="report.zip")["Body"].read() == b"PRODUCER-ZIP-BYTES"
+    assert keys(s3) == ["report", "report.zip"]

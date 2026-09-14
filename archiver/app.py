@@ -68,6 +68,13 @@ def archive_object(bucket, key, sequencer=None, event_etag=None):
         zip_size = buf.tell()
         outcome = write_zip(bucket, key, zip_key, buf, etag, sequencer)
 
+    if outcome == "zip-key-taken":
+        # <key>.zip exists but wasn't written by this function (e.g. the
+        # producer uploaded both "report" and "report.zip"). Don't overwrite
+        # someone else's object; leave the original visible instead.
+        logger.warning("%s exists and wasn't written by the archiver, leaving %s", zip_key, key)
+        return {"key": key, "zip_key": zip_key, "status": "zip-key-taken"}
+
     if outcome == "stale":
         # A zip made from a newer upload of this key is already in place, so
         # this version was overwritten and is not ours to delete.
@@ -113,7 +120,8 @@ def write_zip(bucket, source_key, zip_key, body, source_etag, sequencer):
 
     Returns "written", "already-there" when the zip for this exact source
     version exists (e.g. a retry after failing between upload and delete),
-    or "stale" when the existing zip comes from a newer upload.
+    "stale" when the existing zip comes from a newer upload, or
+    "zip-key-taken" when an object we didn't write already has that key.
     """
     source_etag = source_etag.strip('"')
     metadata = {"source-etag": source_etag}
@@ -132,6 +140,9 @@ def write_zip(bucket, source_key, zip_key, body, source_etag, sequencer):
             condition = {"IfNoneMatch": "*"}
         else:
             theirs = existing.get("Metadata", {})
+            if "source-etag" not in theirs:
+                # every zip this function writes carries source-etag
+                return "zip-key-taken"
             if theirs.get("source-etag") == source_etag:
                 return "already-there"
             if not is_newer(sequencer, theirs.get("source-sequencer")):
